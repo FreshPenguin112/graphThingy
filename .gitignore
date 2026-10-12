@@ -1,0 +1,9 @@
+node_modules
+dist/**
+!dist/.gitkeep
+test_parsing.mjs
+test_mathquill_latex.mjs
+*.lock
+package-lock.json
+jsconfig.json
+tsconfig.json

@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#ffffff" />
+  <title>Methmos</title>
+  <!-- Full MathQuill supports interactive LaTeX commands typed with backslashes. -->
+  <link rel="stylesheet" href="/node_modules/mathquill-webpack/mathquill.css" />
+  <link rel="stylesheet" href="/style.css" />
+
+  <script src="/node_modules/jquery/dist/jquery.min.js"></script>
+  <script src="/node_modules/mathquill-webpack/mathquill.min.js"></script>
+</head>
+<body class="vc-init">
+  <canvas id="graph" aria-label="Coordinate graph. Drag to pan and scroll to zoom."></canvas>
+
+  <section class="panel" aria-label="Graph controls">
+    <header class="graph-panel-header">
+      <div class="brand-mark" aria-hidden="true">ƒx</div>
+      <div class="brand-copy">
+        <h1>Methmos</h1>
+        <span>Graphing calculator</span>
+      </div>
+      <div class="header-actions" aria-label="Graph actions">
+        <button id="resetViewButton" class="header-icon-button" type="button" title="Reset graph view" aria-label="Reset graph view">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10.5 12 4l8 6.5M6.5 9.5V20h11V9.5M9.5 20v-6h5v6"/></svg>
+        </button>
+        <button id="importButton" class="header-icon-button" type="button" title="Import expressions" aria-label="Import expressions">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15V3m-4 4 4-4 4 4M5 14v6h14v-6"/></svg>
+        </button>
+        <button id="exportButton" class="header-icon-button" type="button" title="Export expressions" aria-label="Export expressions">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 14v6h14v-6"/></svg>
+        </button>
+        <button id="clearButton" class="header-icon-button danger-button" type="button" title="Clear all expressions" aria-label="Clear all expressions">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M9 7V4h6v3m-8 0 1 13h8l1-13M10 10v7m4-7v7"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="expression-toolbar">
+      <button id="addExpressionButton" class="add-expression-button" type="button" title="Add an expression">
+        <span class="plus-glyph" aria-hidden="true">+</span><span>Add Item</span>
+      </button>
+      <span class="toolbar-spacer"></span>
+      <button id="exampleButton" class="subtle-button" type="button" title="Load the heart-curve example">♥ Example</button>
+      <button id="autoCalculateToggle" class="subtle-button active-toggle" type="button" aria-pressed="true" title="Toggle automatic graph calculation">Auto</button>
+      <button id="calculateButton" class="subtle-button" type="button" hidden="">Calculate</button>
+    </div>
+
+    <div class="equations" id="equations" aria-label="Expressions"></div>
+
+    <footer class="panel-footer">
+      <div id="status" role="status" aria-live="polite">Loading math engine…</div>
+      <div class="keyboard-hint">Enter <kbd>↵</kbd> next expression <span>·</span> Shift+Enter piecewise</div>
+    </footer>
+    <input id="importFileInput" type="file" accept=".json,application/json" hidden="" />
+  </section>
+
+  <script type="module" src="/index.js"></script>
+
+
+</body></html>
