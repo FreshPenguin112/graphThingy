@@ -22,6 +22,9 @@
         <span>Graphing calculator</span>
       </div>
       <div class="header-actions" aria-label="Graph actions">
+        <button id="cameraControlButton" class="header-icon-button" type="button" title="Go to coordinates" aria-label="Open camera controls" aria-haspopup="dialog" aria-expanded="false" aria-controls="cameraControlWindow">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7.5"/><circle cx="12" cy="12" r="2.5"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3"/></svg>
+        </button>
         <button id="resetViewButton" class="header-icon-button" type="button" title="Reset graph view" aria-label="Reset graph view">
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10.5 12 4l8 6.5M6.5 9.5V20h11V9.5M9.5 20v-6h5v6"/></svg>
         </button>
@@ -55,6 +58,18 @@
     </footer>
     <input id="importFileInput" type="file" accept=".json,application/json" hidden="" />
   </section>
+
+  <aside id="cameraControlWindow" class="camera-window" role="dialog" aria-modal="false" aria-labelledby="cameraControlTitle" hidden>
+    <header class="camera-window-header">
+      <h2 id="cameraControlTitle">Go to coordinates</h2>
+      <button id="cameraControlClose" class="header-icon-button" type="button" title="Close camera controls" aria-label="Close camera controls">×</button>
+    </header>
+    <div class="camera-window-body">
+      <div id="cameraCoordinateField" class="camera-coordinate-field" role="textbox" aria-label="Target ordered pair" aria-multiline="false"></div>
+      <button id="cameraJumpButton" class="camera-jump-button" type="button">Jump</button>
+      <div id="cameraControlStatus" class="camera-control-status" role="status" aria-live="polite"></div>
+    </div>
+  </aside>
 
   <script type="module" src="/index.js"></script>
 

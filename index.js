@@ -1,5 +1,17 @@
 import { ComputeEngine, compile } from "@cortex-js/compute-engine";
 import { prepareMathQuillLatex } from "./mathquill-latex.js";
+import { centerCameraOn } from "./camera-geometry.js";
+import {
+  lowerIdenticallyEqualForGraph,
+  normalizePiecewiseConditionEquivalence,
+  normalizePiecewiseEquivalenceForDefinition,
+} from "./plot-ast.js";
+import {
+  assertAssignmentOnlyEquals,
+  equalityKeyAction,
+  normalizeEqualityShorthand,
+  normalizeMathQuillSpacing,
+} from "./math-equality.js";
 
 /** @typedef {import('@cortex-js/compute-engine').ComputeEngine} ComputeEngineInstance */
 /** @typedef {import('@cortex-js/compute-engine').Expression} BoxedExpression */
@@ -55,6 +67,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   const autoCalculateToggle = /** @type {HTMLButtonElement} */ (document.querySelector("#autoCalculateToggle"));
   const calculateButton = /** @type {HTMLButtonElement} */ (document.querySelector("#calculateButton"));
   const addExpressionButton = /** @type {HTMLButtonElement} */ (document.querySelector("#addExpressionButton"));
+  const cameraControlButton = /** @type {HTMLButtonElement} */ (document.querySelector("#cameraControlButton"));
+  const cameraControlWindow = /** @type {HTMLElement} */ (document.querySelector("#cameraControlWindow"));
+  const cameraControlClose = /** @type {HTMLButtonElement} */ (document.querySelector("#cameraControlClose"));
+  const cameraCoordinateField = /** @type {HTMLElement} */ (document.querySelector("#cameraCoordinateField"));
+  const cameraJumpButton = /** @type {HTMLButtonElement} */ (document.querySelector("#cameraJumpButton"));
+  const cameraControlStatus = /** @type {HTMLDivElement} */ (document.querySelector("#cameraControlStatus"));
 
   // Keep the color picker outside the scrolling expression list so it is never
   // clipped by the list's overflow when it opens near the bottom of the panel.
@@ -133,6 +151,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     return;
   }
   const MQ = mathQuillGlobal.getInterface(2);
+  let cameraMathField = null;
 
   // MathQuill can route keyboard and clipboard events through a hidden textarea
   // instead of the visible expression span. Remember the last field the user
@@ -254,19 +273,19 @@ window.addEventListener("DOMContentLoaded", async () => {
    * and is left exactly as copied.
    */
   function convertPlainMathText(source) {
-    let text = String(source);
+    const isLatex = String(source).includes("\\");
+    let text = normalizeEqualityShorthand(source);
     // Unicode symbols and ASCII comparison operators are never valid LaTeX, so
     // they are converted even inside a LaTeX paste (e.g. `x>=0` in a cases block).
     text = text.replace(/[⁰¹²³⁴-⁹⁺⁻]+/g,
       (run) => `^{${[...run].map((ch) => SUPERSCRIPT_DIGITS[ch]).join("")}}`);
-    const isLatex = text.includes("\\");
     text = text.replace(/√\s*\(/g, "sqrt(")
       .replace(/√\s*([A-Za-z0-9.]+)/g, "\\sqrt{$1}");
     text = [...text].map((ch) => (Object.hasOwn(UNICODE_MATH, ch) ? UNICODE_MATH[ch] : ch)).join("");
     text = text.replace(/<=/g, "\\le ").replace(/>=/g, "\\ge ").replace(/!=/g, "\\ne ");
     // Everything below guesses what plain text means, so real LaTeX is left alone.
     if (isLatex) return text;
-    text = text.replace(/==/g, "=").replace(/\*\*/g, "^").replace(/\*/g, "\\cdot ");
+    text = text.replace(/\*\*/g, "^").replace(/\*/g, "\\cdot ");
     // x^10 -> x^{10},  x^-1 -> x^{-1},  x^(n+1) -> x^{n+1}
     text = text.replace(/\^\s*(-?\d+(?:\.\d+)?)/g, "^{$1}")
       .replace(/\^\s*\(([^()]*)\)/g, "^{$1}");
@@ -391,16 +410,66 @@ window.addEventListener("DOMContentLoaded", async () => {
   let periodSequenceField = null;
   let periodSequenceCount = 0;
   let periodSequenceAt = 0;
+  let equalitySequenceField = null;
+  let equalitySequenceCount = 0;
+  let equalitySequenceAt = 0;
   function resetPeriodSequence() {
     periodSequenceField = null;
     periodSequenceCount = 0;
     periodSequenceAt = 0;
   }
+  function resetEqualitySequence() {
+    equalitySequenceField = null;
+    equalitySequenceCount = 0;
+    equalitySequenceAt = 0;
+  }
   document.addEventListener("pointerdown", resetPeriodSequence, true);
   document.addEventListener("click", resetPeriodSequence, true);
+  document.addEventListener("pointerdown", resetEqualitySequence, true);
+  document.addEventListener("click", resetEqualitySequence, true);
 
   document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !cameraControlWindow.hidden) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      closeCameraControlWindow();
+      return;
+    }
+    if (event.key === "Enter" && cameraCoordinateField.classList.contains("mq-focused")) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      jumpToCameraTarget();
+      return;
+    }
+
     const input = getFocusedMathFieldElement(event);
+    if (!["Shift", "Control", "Alt", "Meta"].includes(event.key) && event.key !== "=") {
+      resetEqualitySequence();
+    }
+    if (event.key === "=" && !event.repeat && !event.ctrlKey && !event.metaKey && !event.altKey && input?.mathField) {
+      const now = performance.now();
+      equalitySequenceCount = equalitySequenceField === input && now - equalitySequenceAt < 900
+        ? equalitySequenceCount + 1 : 1;
+      equalitySequenceField = input;
+      equalitySequenceAt = now;
+      const action = equalityKeyAction(equalitySequenceCount);
+      if (action !== "pass") {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (action === "swallow") {
+          resetEqualitySequence();
+        } else {
+          try {
+            input.mathField.keystroke("Backspace");
+            input.mathField.write(String.raw`\equiv`);
+          } catch (error) {
+            resetEqualitySequence();
+            console.warn("Could not replace typed equality shorthand:", error);
+          }
+        }
+        return;
+      }
+    }
 
     // Keep the old `product(` shorthand: a completed lowercase word becomes the
     // large product operator only when followed by a delimiter at the field end.
@@ -569,10 +638,12 @@ window.addEventListener("DOMContentLoaded", async () => {
         (_m, glyph) => glyph === "\\}" ? "\\}" : glyph);
   }
 
-  function normalizeLatex(source, knownNames = []) {
+  function normalizeLatex(source, knownNames = [], allowGeneratedConditionEquality = false) {
+    const equalityNormalizedSource = normalizeEqualityShorthand(source);
+    assertAssignmentOnlyEquals(equalityNormalizedSource, { allowGeneratedConditionEquality });
     // Spacing is folded to a plain space only here, on parser input.
     let result = repairMalformedFunctionNotation(
-      normalizeSpreadNotation(normalizeLatexSpacing(stripDelimiterDecoration(source))),
+      normalizeSpreadNotation(normalizeLatexSpacing(stripDelimiterDecoration(equalityNormalizedSource))),
     );
     // Treat logical words as operators, regardless of whether MathQuill serialized
     // them as plain text, operator names, or ordinary words. Word boundaries keep
@@ -752,12 +823,7 @@ window.addEventListener("DOMContentLoaded", async () => {
         .replace(/(?<![A-Za-z0-9_])or(?![A-Za-z0-9_])/gi, "\\lor");
 
 
-      // In piecewise graph predicates, users commonly write `\equiv` as an
-      // equality-style relation (for example, floor(x) \equiv x to select
-      // integers). The Compute Engine treats this as logical equivalence rather
-      // than numeric equality, which can make it true for only a tiny subset of
-      // numeric inputs. Normalize it to ordinary equality for condition testing.
-      result = result.replace(/\\equiv\b/g, "=");
+      result = normalizePiecewiseConditionEquivalence(result);
 
       const simple = compactLatex(result).toLowerCase();
       if (["true", "\\text{true}", "\\mathrm{true}", "\\top", "top", "⊤"].includes(simple)) return "\\top";
@@ -820,7 +886,7 @@ window.addEventListener("DOMContentLoaded", async () => {
         if (sawColonStyle && index === entries.length - 1 && entry.trim()) {
           // Our evaluator intentionally collects every matching branch. Make the
           // fallback mutually exclusive by negating all preceding colon conditions.
-          const conditions = branches.map((item) => normalizeCondition(item.condition));
+          const conditions = branches.map((item) => item.condition);
           const anyPrevious = conditions.map((condition) => `\\left(${condition}\\right)`).join("\\lor");
           branches.push({ condition: `\\neg\\left(${anyPrevious}\\right)`, output: entry.trim() });
           continue;
@@ -1017,7 +1083,8 @@ window.addEventListener("DOMContentLoaded", async () => {
           // lets a variable contain a comprehension and lets downstream graph rows
           // iterate over lists produced by either variables or functions.
           const collectionRhs = transformCollectionSyntax(def.rhs || "", ce, names);
-          const rhs = normalizeLatex(collectionRhs, names);
+          const normalizedRhs = normalizePiecewiseEquivalenceForDefinition(collectionRhs);
+          const rhs = normalizeLatex(normalizedRhs, names, true);
           if (def.kind === "variable") {
             const expression = ce.parse(rhs);
             if (expression?.isValid) assignAnyDefinitionValue(ce, def.name, expression);
@@ -1139,9 +1206,9 @@ window.addEventListener("DOMContentLoaded", async () => {
       context.nextPiecewiseIndex++;
       const prepared = branches.map((branch) => {
         const outputSource = transformPiecewise(branch.output, context);
-        const conditionSource = transformPiecewise(normalizeCondition(branch.condition), context);
+        const conditionSource = transformPiecewise(branch.condition, context);
         const outputExpr = context.ce.parse(normalizeLatex(outputSource, context.knownNames));
-        const conditionExpr = context.ce.parse(normalizeLatex(conditionSource, context.knownNames));
+        const conditionExpr = context.ce.parse(normalizeLatex(conditionSource, context.knownNames, true));
         if (!outputExpr?.isValid || !conditionExpr?.isValid) {
           const invalid = !outputExpr?.isValid ? outputExpr : conditionExpr;
           const details = invalid?.errors?.map(String).join("; ");
@@ -1240,10 +1307,12 @@ window.addEventListener("DOMContentLoaded", async () => {
         const usesMembership = (node) => Array.isArray(node)
           && (["Element", "NotElement", "Subset", "Superset", "SubsetEqual", "SupersetEqual"].includes(String(node[0]))
             || node.slice(1).some(usesMembership));
-        const compileAst = rewriteMembership(ast);
+        const usesSet = (node) => Array.isArray(node)
+          && (String(node[0]) === "Set" || node.slice(1).some(usesSet));
+        const compileAst = lowerIdenticallyEqualForGraph(rewriteMembership(ast));
         const boxedForCompile = ce.box(compileAst);
         let compiled = null;
-        if (!usesMembership(compileAst)) {
+        if (!usesMembership(compileAst) && !usesSet(compileAst)) {
           try { compiled = compile(boxedForCompile); } catch { /* use engine fallback */ }
         }
         const run = (vars) => {
@@ -2710,6 +2779,7 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   /** Split a top-level equality/inequality without confusing LaTeX commands with relation tokens. */
   function splitEquation(latex) {
+    latex = normalizeMathQuillSpacing(latex);
     let depth = 0;
     for (let i = 0; i < latex.length; i++) {
       // Skip complete environments so comparisons inside a cases condition
@@ -2750,7 +2820,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
 
   /** @param {string} source */
-  function parseExpression(source) {
+  function parseExpression(source, allowGeneratedConditionEquality = false) {
     let normalizedSource = String(source)
       .replace(/\\Reals\b/g, "\\mathbb{R}")
       .replace(/\\RealNumbers\b/g, "\\mathbb{R}")
@@ -2763,7 +2833,11 @@ window.addEventListener("DOMContentLoaded", async () => {
       .replace(/\\left|\\right/g, "")
       .replace(/\\lbrack/g, "[")
       .replace(/\\rbrack/g, "]");
-    const expr = ce.parse(normalizeLatex(normalizedSource, [...knownDefinitionNames]));
+    const expr = ce.parse(normalizeLatex(
+      normalizedSource,
+      [...knownDefinitionNames],
+      allowGeneratedConditionEquality,
+    ));
     if (!expr || !expr.isValid) {
       throw new Error(`Could not parse “${source}”. Check the LaTeX syntax.`);
     }
@@ -3371,15 +3445,18 @@ window.addEventListener("DOMContentLoaded", async () => {
       if (item.error || !item.name || !validNames.has(item.name) || !item.rhs) continue;
       try {
         const collectionRhs = transformCollectionSyntax(item.rhs, ce, validNames);
-        const rhs = normalizeKnownIdentifiers(collectionRhs, validNames);
+        const rhs = normalizeKnownIdentifiers(
+          normalizePiecewiseEquivalenceForDefinition(collectionRhs),
+          validNames,
+        );
         if (item.kind === "function") {
           const args = item.args || [];
           const lhs = `${latexIdentifier(item.name)}(${args.map(latexIdentifier).join(",")})`;
-          const assignment = parseExpression(`${lhs} := ${rhs}`);
+          const assignment = parseExpression(`${lhs} := ${rhs}`, true);
           assignment.evaluate();
         } else {
           /** @type {BoxedExpression} */
-          const rhsExpression = parseExpression(rhs);
+          const rhsExpression = parseExpression(rhs, true);
           assignAnyDefinitionValue(ce, item.name, rhsExpression);
         }
       } catch (error) {
@@ -4734,6 +4811,87 @@ window.addEventListener("DOMContentLoaded", async () => {
     draw();
   }
 
+  function cameraCoordinateLatex(value) {
+    const text = String(Number(value.toPrecision(10)));
+    const scientific = text.match(/^(-?\d+(?:\.\d+)?)e([+-]?\d+)$/i);
+    return scientific ? `${scientific[1]}\\times10^{${Number(scientific[2])}}` : text;
+  }
+
+  function setCameraControlStatus(message, isError = false) {
+    cameraControlStatus.textContent = message;
+    cameraControlStatus.classList.toggle("error", isError);
+  }
+
+  function openCameraControlWindow() {
+    const centerX = camera.xMin + (camera.xMax - camera.xMin) / 2;
+    const centerY = camera.yMin + (camera.yMax - camera.yMin) / 2;
+    cameraControlWindow.hidden = false;
+    cameraControlButton.setAttribute("aria-expanded", "true");
+    setCameraControlStatus("");
+    cameraMathField.latex(String.raw`\left(${cameraCoordinateLatex(centerX)},${cameraCoordinateLatex(centerY)}\right)`);
+    cameraMathField.focus();
+    cameraMathField.moveToRightEnd();
+    requestAnimationFrame(() => cameraMathField.reflow?.());
+  }
+
+  function closeCameraControlWindow() {
+    cameraControlWindow.hidden = true;
+    cameraControlButton.setAttribute("aria-expanded", "false");
+    cameraControlButton.focus();
+  }
+
+  function evaluateCameraTarget(source) {
+    const latex = String(source ?? "").trim();
+    if (!latex) throw new Error("Enter an ordered pair.");
+    const piecewiseContext = { ce, knownNames: knownDefinitionNames, piecewise: new Map(), nextPiecewiseIndex: 0 };
+    const collectionSource = transformCollectionSyntax(latex, ce, knownDefinitionNames);
+    const transformedSource = transformPiecewise(collectionSource, piecewiseContext);
+    const expression = ce.parse(normalizeLatex(transformedSource, knownDefinitionNames));
+    if (!expression?.isValid) {
+      const details = expression?.errors?.map(String).join("; ");
+      throw new Error(details || "Could not parse this expression.");
+    }
+
+    const unknowns = [...(expression.unknowns || [])].map(String);
+    if (unknowns.includes("x") || unknowns.includes("y")) {
+      throw new Error("The target pair must be constant and cannot depend on x or y.");
+    }
+    const point = pointValueFromExpression(expression, true);
+    if (point) return point;
+
+    const evaluated = createAstEvaluator(ce, piecewiseContext.piecewise).evaluate(expression.json, {});
+    if (Array.isArray(evaluated) && evaluated.length === 2) {
+      const coordinates = evaluated.map((value) => {
+        if (typeof value === "number") return cleanRealNumber(value);
+        if (typeof value === "boolean" || Array.isArray(value) || typeof value === "string") return null;
+        try { return numericRealValue(ce.box(value)); } catch { return null; }
+      });
+      if (coordinates[0] !== null && coordinates[1] !== null) {
+        return { x: coordinates[0], y: coordinates[1] };
+      }
+    }
+    throw new Error("Enter one constant ordered pair with two finite real coordinates.");
+  }
+
+  function jumpToCameraTarget() {
+    try {
+      const point = evaluateCameraTarget(cameraMathField.latex());
+      if (wheelTimer) {
+        clearTimeout(wheelTimer);
+        wheelTimer = 0;
+        wheelBaseCamera = null;
+      }
+      hideHoverTooltip();
+      centerCameraOn(camera, point);
+      draw();
+      setCameraControlStatus(`Centered at (${formatReadoutCoordinate(point.x)}, ${formatReadoutCoordinate(point.y)})`);
+      cameraMathField.focus();
+    } catch (error) {
+      setCameraControlStatus(error instanceof Error ? error.message : String(error), true);
+      cameraMathField.focus();
+    }
+  }
+
   autoCalculateToggle.addEventListener("click", () => {
     autoCalculate = !autoCalculate;
     updateCalculationControls();
@@ -4991,6 +5149,17 @@ window.addEventListener("DOMContentLoaded", async () => {
   }, { passive: false });
 
   window.addEventListener("resize", resize);
+  cameraMathField = MQ.MathField(cameraCoordinateField, {
+    restrictMismatchedBrackets: true,
+    autoOperatorNames: MATHQUILL_AUTO_OPERATOR_NAMES,
+    autoCommands: "pi theta sqrt sum prod coprod",
+  });
+  cameraControlButton.addEventListener("click", () => {
+    if (cameraControlWindow.hidden) openCameraControlWindow();
+    else closeCameraControlWindow();
+  });
+  cameraControlClose.addEventListener("click", closeCameraControlWindow);
+  cameraJumpButton.addEventListener("click", jumpToCameraTarget);
   updateCalculationControls();
   resize();
   addEquation(String.raw`y=x^{2}`);
