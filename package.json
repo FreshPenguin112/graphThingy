@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port 8080",
     "build": "vite build; touch dist/.gitkeep",
-    "preview": "vite preview --host 0.0.0.0 --port 8080"
+    "preview": "vite preview --host 0.0.0.0 --port 8080",
+    "check:native": "node scripts/check-native-scalar.mjs"
   },
   "dependencies": {
     "@cortex-js/compute-engine": "0.149.0",
