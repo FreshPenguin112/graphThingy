@@ -11,10 +11,16 @@
   <script src="/node_modules/jquery/dist/jquery.min.js"></script>
   <script src="/node_modules/mathquill-webpack/mathquill.min.js"></script>
 </head>
-<body class="vc-init">
+<body class="vc-init app-shell">
+  <div class="mobile-topbar" aria-label="Graph actions">
+    <button id="mobileAddExpressionButton" class="mobile-action-button" type="button">Add</button>
+    <button id="mobileResetButton" class="mobile-action-button" type="button">Reset</button>
+    <button id="mobileKeyboardToggle" class="mobile-action-button" type="button">Keyboard</button>
+  </div>
+
   <canvas id="graph" aria-label="Coordinate graph. Drag to pan and scroll to zoom."></canvas>
 
-  <section class="panel" aria-label="Graph controls">
+  <section class="panel" id="expressionDrawer" aria-label="Graph controls">
     <header class="graph-panel-header">
       <div class="brand-mark" aria-hidden="true">ƒx</div>
       <div class="brand-copy">
@@ -45,6 +51,7 @@
         <span class="plus-glyph" aria-hidden="true">+</span><span>Add Item</span>
       </button>
       <span class="toolbar-spacer"></span>
+      <button id="drawerCloseButton" class="drawer-close-button" type="button" aria-label="Close expression drawer">Close</button>
       <button id="exampleButton" class="subtle-button" type="button" title="Load the heart-curve example">♥ Example</button>
       <button id="autoCalculateToggle" class="subtle-button active-toggle" type="button" aria-pressed="true" title="Toggle automatic graph calculation">Auto</button>
       <button id="calculateButton" class="subtle-button" type="button" hidden="">Calculate</button>
@@ -70,6 +77,154 @@
       <div id="cameraControlStatus" class="camera-control-status" role="status" aria-live="polite"></div>
     </div>
   </aside>
+
+  <div id="mobileKeyboard" class="mobile-keyboard" hidden aria-label="Expression symbol keyboard" data-mode="math">
+    <div class="keyboard-mode-bar" role="group" aria-label="Keyboard mode">
+      <button type="button" class="keyboard-mode-button active" data-keyboard-mode="math" aria-pressed="true">Math</button>
+      <button type="button" class="keyboard-mode-button" data-keyboard-mode="text" aria-pressed="false">ABC</button>
+      <button type="button" class="keyboard-mode-button" data-keyboard-mode="symbols" aria-pressed="false">Symbols</button>
+    </div>
+    <div class="keyboard-symbol-search">
+      <label class="sr-only" for="mobileSymbolSearch">Search mathematical symbols</label>
+      <input id="mobileSymbolSearch" type="search" inputmode="none" autocomplete="off" spellcheck="false" placeholder="Search symbols or commands" aria-label="Search mathematical symbols" />
+    </div>
+    <div class="keyboard-row keyboard-edit-controls" aria-label="Editing keys">
+      <button type="button" data-keystroke="Backspace" aria-label="Backspace">⌫</button>
+      <button type="button" data-keystroke="Left" aria-label="Move cursor left">←</button>
+      <button type="button" data-keystroke="Down" aria-label="Move cursor down">↓</button>
+      <button type="button" data-keystroke="Up" aria-label="Move cursor up">↑</button>
+      <button type="button" data-keystroke="Right" aria-label="Move cursor right">→</button>
+      <button type="button" data-action="complete-command" aria-label="Complete command">Tab</button>
+    </div>
+    <div class="keyboard-mode-group keyboard-mode-math">
+      <div class="keyboard-row keyboard-numbers">
+        <button type="button" data-insert="0">0</button>
+        <button type="button" data-insert="1">1</button>
+        <button type="button" data-insert="2">2</button>
+        <button type="button" data-insert="3">3</button>
+        <button type="button" data-insert="4">4</button>
+        <button type="button" data-insert="5">5</button>
+        <button type="button" data-insert="6">6</button>
+        <button type="button" data-insert="7">7</button>
+        <button type="button" data-insert="8">8</button>
+        <button type="button" data-insert="9">9</button>
+      </div>
+      <div class="keyboard-row keyboard-functions">
+        <button type="button" data-insert="x">x</button>
+        <button type="button" data-insert="y">y</button>
+        <button type="button" data-insert="z">z</button>
+        <button type="button" data-insert="\alpha">α</button>
+        <button type="button" data-insert="\beta">β</button>
+        <button type="button" data-insert="\sum">Σ</button>
+        <button type="button" data-insert="\sqrt{}">√</button>
+        <button type="button" data-insert="\pi">π</button>
+        <button type="button" data-insert="\theta">θ</button>
+        <button type="button" data-insert="\cdot">·</button>
+      </div>
+      <div class="keyboard-row keyboard-operators">
+        <button type="button" data-insert="+">+</button>
+        <button type="button" data-insert="-">−</button>
+        <button type="button" data-insert="\times">×</button>
+        <button type="button" data-insert="\frac{}{}">÷</button>
+        <button type="button" data-insert="( )">( )</button>
+        <button type="button" data-insert="\left(\right)">()</button>
+        <button type="button" data-insert="\operatorname{}">op</button>
+        <button type="button" data-insert="\sin">sin</button>
+        <button type="button" data-insert="\cos">cos</button>
+        <button type="button" data-insert="\tan">tan</button>
+      </div>
+      <div class="keyboard-row keyboard-equation-keys">
+        <button type="button" data-insert="=">=</button>
+        <button type="button" data-power="" aria-label="Insert an empty exponent">a^b</button>
+        <button type="button" data-power="1">a^1</button>
+        <button type="button" data-power="2">a^2</button>
+        <button type="button" data-power="3">a^3</button>
+        <button type="button" data-power="4">a^4</button>
+      </div>
+      <div class="keyboard-row keyboard-equation-keys">
+        <button type="button" data-power="5">a^5</button>
+        <button type="button" data-power="6">a^6</button>
+        <button type="button" data-power="7">a^7</button>
+        <button type="button" data-power="8">a^8</button>
+        <button type="button" data-power="9">a^9</button>
+        <button type="button" data-power="10">a^10</button>
+      </div>
+    </div>
+    <div class="keyboard-mode-group keyboard-mode-text" hidden>
+      <div class="keyboard-row keyboard-case-controls">
+        <button type="button" data-case="shift" aria-pressed="false" aria-label="Shift once">⇧ Shift</button>
+        <button type="button" data-case="caps-lock" aria-pressed="false" aria-label="Toggle Caps Lock">Caps</button>
+      </div>
+      <div class="keyboard-row keyboard-text-row">
+        <button type="button" data-insert="q">q</button>
+        <button type="button" data-insert="w">w</button>
+        <button type="button" data-insert="e">e</button>
+        <button type="button" data-insert="r">r</button>
+        <button type="button" data-insert="t">t</button>
+        <button type="button" data-insert="y">y</button>
+        <button type="button" data-insert="u">u</button>
+        <button type="button" data-insert="i">i</button>
+        <button type="button" data-insert="o">o</button>
+        <button type="button" data-insert="p">p</button>
+      </div>
+      <div class="keyboard-row keyboard-text-row keyboard-text-home-row">
+        <button type="button" data-insert="a">a</button>
+        <button type="button" data-insert="s">s</button>
+        <button type="button" data-insert="d">d</button>
+        <button type="button" data-insert="f">f</button>
+        <button type="button" data-insert="g">g</button>
+        <button type="button" data-insert="h">h</button>
+        <button type="button" data-insert="j">j</button>
+        <button type="button" data-insert="k">k</button>
+        <button type="button" data-insert="l">l</button>
+      </div>
+      <div class="keyboard-row keyboard-text-row">
+        <button type="button" data-insert="z">z</button>
+        <button type="button" data-insert="x">x</button>
+        <button type="button" data-insert="c">c</button>
+        <button type="button" data-insert="v">v</button>
+        <button type="button" data-insert="b">b</button>
+        <button type="button" data-insert="n">n</button>
+        <button type="button" data-insert="m">m</button>
+        <button type="button" data-insert="{">{</button>
+        <button type="button" data-insert="}">}</button>
+        <button type="button" data-insert="_">_</button>
+      </div>
+      <div class="keyboard-row keyboard-text-row">
+        <button type="button" data-insert="0">0</button>
+        <button type="button" data-insert="1">1</button>
+        <button type="button" data-insert="2">2</button>
+        <button type="button" data-insert="3">3</button>
+        <button type="button" data-insert="4">4</button>
+        <button type="button" data-insert="5">5</button>
+        <button type="button" data-insert="6">6</button>
+        <button type="button" data-insert="7">7</button>
+        <button type="button" data-insert="8">8</button>
+        <button type="button" data-insert="9">9</button>
+      </div>
+      <div class="keyboard-row keyboard-text-punctuation">
+        <button type="button" data-insert="&#92;">&#92;</button>
+        <button type="button" data-insert="{">{</button>
+        <button type="button" data-insert="}">}</button>
+        <button type="button" data-insert="^">^</button>
+        <button type="button" data-insert="_">_</button>
+        <button type="button" data-insert="=">=</button>
+        <button type="button" data-insert=",">,</button>
+        <button type="button" data-insert=";">;</button>
+        <button type="button" data-insert=":">:</button>
+        <button type="button" data-insert="!">!</button>
+      </div>
+    </div>
+    <div class="keyboard-mode-group keyboard-mode-symbols" hidden>
+      <div id="mobileSymbolCategories" class="keyboard-symbol-categories" role="group" aria-label="Symbol category"></div>
+      <div id="mobileSymbolResults" class="keyboard-symbol-results" role="group" aria-label="Matching mathematical symbols"></div>
+    </div>
+    <div class="keyboard-advanced">
+      <label class="sr-only" for="mobileLatexInput">Advanced LaTeX</label>
+      <input id="mobileLatexInput" type="text" inputmode="none" spellcheck="false" placeholder="\angle, \left\lbrack, \operatorname{foo}" aria-label="Advanced LaTeX input" />
+      <button id="mobileLatexInsertButton" type="button">Insert</button>
+    </div>
+  </div>
 
   <script type="module" src="/index.js"></script>
 

@@ -11,6 +11,14 @@ import {
   stripDelimiterDecoration,
   repairMalformedFunctionNotation,
 } from "./sampler.js";
+import { normalizeTouchGesture } from "./mobile-gesture.js";
+import {
+  filterMobileSymbols,
+  MOBILE_KEYBOARD_CATEGORIES,
+  MOBILE_KEYBOARD_SYMBOLS,
+  mobileKeyboardLetter,
+  mobileKeyboardPower,
+} from "./mobile-keyboard-symbols.js";
 import { prepareMathQuillLatex } from "./mathquill-latex.js";
 import { centerCameraOn } from "./camera-geometry.js";
 import {
@@ -44,6 +52,7 @@ import {
  * @property {string} [expressionValue]
  * @property {string} error
  * @property {boolean} fallback
+ * @property {string} [fallbackReason]
  * @property {(x:number, y:number) => number} evaluate
  * @property {string} [name]
  * @property {string[]} [args]
@@ -80,6 +89,21 @@ window.addEventListener("DOMContentLoaded", async () => {
   const autoCalculateToggle = /** @type {HTMLButtonElement} */ (document.querySelector("#autoCalculateToggle"));
   const calculateButton = /** @type {HTMLButtonElement} */ (document.querySelector("#calculateButton"));
   const addExpressionButton = /** @type {HTMLButtonElement} */ (document.querySelector("#addExpressionButton"));
+  const drawer = /** @type {HTMLElement} */ (document.querySelector("#expressionDrawer"));
+  const drawerCloseButton = /** @type {HTMLButtonElement} */ (document.querySelector("#drawerCloseButton"));
+  const mobileAddExpressionButton = /** @type {HTMLButtonElement} */ (document.querySelector("#mobileAddExpressionButton"));
+  const mobileResetButton = /** @type {HTMLButtonElement} */ (document.querySelector("#mobileResetButton"));
+  const mobileKeyboardToggle = /** @type {HTMLButtonElement} */ (document.querySelector("#mobileKeyboardToggle"));
+  const mobileKeyboard = /** @type {HTMLElement} */ (document.querySelector("#mobileKeyboard"));
+  const mobileLatexInput = /** @type {HTMLInputElement} */ (document.querySelector("#mobileLatexInput"));
+  const mobileLatexInsertButton = /** @type {HTMLButtonElement} */ (document.querySelector("#mobileLatexInsertButton"));
+  const mobileSymbolSearch = /** @type {HTMLInputElement} */ (document.querySelector("#mobileSymbolSearch"));
+  const mobileSymbolCategories = /** @type {HTMLDivElement} */ (document.querySelector("#mobileSymbolCategories"));
+  const mobileSymbolResults = /** @type {HTMLDivElement} */ (document.querySelector("#mobileSymbolResults"));
+  const isTouchInterface = window.matchMedia("(pointer: coarse)").matches || navigator.maxTouchPoints > 0 || "ontouchstart" in window;
+  let mobileShiftActive = false;
+  let mobileCapsLockActive = false;
+  let activeMobileSymbolCategory = "All";
   const cameraControlButton = /** @type {HTMLButtonElement} */ (document.querySelector("#cameraControlButton"));
   const cameraControlWindow = /** @type {HTMLElement} */ (document.querySelector("#cameraControlWindow"));
   const cameraControlClose = /** @type {HTMLButtonElement} */ (document.querySelector("#cameraControlClose"));
@@ -149,11 +173,176 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (activeColorAnchor && activeColorAnchor.contains(target)) return;
     closeColorPalette();
   });
+  function getActiveMathField() {
+    const activeElement = document.activeElement;
+    const activeField = activeElement?.closest?.(".equation-preview") || lastFocusedMathFieldElement;
+    const candidate = activeField?.mathField || activeField?.piecewiseMathField || null;
+    return candidate;
+  }
+
+  function ensureFocusedEquationField(row = null) {
+    const focused = document.activeElement?.closest?.(".equation-preview") || lastFocusedMathFieldElement;
+    const target = row || focused || document.querySelector(".equation-row:last-of-type .equation-preview");
+    const field = target?.mathField ? target : target?.querySelector?.(".equation-preview") || target;
+    if (!field) return null;
+    lastFocusedMathFieldElement = field;
+    const mathField = field.mathField || field.piecewiseMathField || null;
+    if (mathField && typeof mathField.focus === "function") {
+      mathField.focus();
+      return mathField;
+    }
+    if (typeof field.focus === "function") {
+      field.focus();
+    }
+    return mathField;
+  }
+
+  function insertIntoActiveMathField(latex) {
+    const field = getActiveMathField() || ensureFocusedEquationField();
+    if (!field) return;
+    field.write(String(latex ?? ""));
+  }
+
+  function openMobileKeyboard() {
+    if (!mobileKeyboard) return;
+    mobileKeyboard.hidden = false;
+    drawer?.classList.add("mobile-open");
+  }
+
+  function closeMobileKeyboard() {
+    if (!mobileKeyboard) return;
+    mobileKeyboard.hidden = true;
+  }
+
+  function setMobileKeyboardMode(mode) {
+    if (!mobileKeyboard) return;
+    const nextMode = ["math", "text", "symbols"].includes(mode) ? mode : "math";
+    mobileKeyboard.dataset.mode = nextMode;
+    mobileKeyboard.querySelectorAll("[data-keyboard-mode]").forEach((button) => {
+      const selected = button.getAttribute("data-keyboard-mode") === nextMode;
+      button.classList.toggle("active", selected);
+      button.setAttribute("aria-pressed", String(selected));
+    });
+    for (const [key, modeName] of [["math", "math"], ["text", "text"], ["symbols", "symbols"]]) {
+      const group = mobileKeyboard.querySelector(`.keyboard-mode-${key}`);
+      if (group) group.hidden = nextMode !== modeName;
+    }
+    const advancedInput = mobileLatexInput?.closest(".keyboard-advanced");
+    if (advancedInput) advancedInput.hidden = nextMode !== "text";
+    if (mobileSymbolSearch) mobileSymbolSearch.closest(".keyboard-symbol-search").hidden = nextMode === "math";
+    renderMobileSymbolCategories();
+    renderMobileSymbolResults();
+  }
+
+  function renderMobileSymbolCategories() {
+    if (!mobileSymbolCategories) return;
+    const categories = ["All", ...MOBILE_KEYBOARD_CATEGORIES];
+    mobileSymbolCategories.replaceChildren();
+    for (const category of categories) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "keyboard-category-button";
+      button.dataset.symbolCategory = category;
+      button.textContent = category;
+      button.setAttribute("aria-pressed", String(category === activeMobileSymbolCategory));
+      mobileSymbolCategories.append(button);
+    }
+  }
+
+  function renderMobileSymbolResults() {
+    if (!mobileSymbolResults) return;
+    const matches = filterMobileSymbols(MOBILE_KEYBOARD_SYMBOLS, {
+      category: activeMobileSymbolCategory,
+      query: mobileSymbolSearch?.value || "",
+    });
+    mobileSymbolResults.replaceChildren();
+    if (!matches.length) {
+      const empty = document.createElement("div");
+      empty.className = "keyboard-symbol-empty";
+      empty.textContent = "No matching symbols";
+      mobileSymbolResults.append(empty);
+      return;
+    }
+    for (const symbol of matches) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.dataset.symbolId = String(symbol.id);
+      button.title = `${symbol.label} (${symbol.latex})`;
+      button.setAttribute("role", "listitem");
+      button.setAttribute("aria-label", `Insert ${symbol.label}, ${symbol.latex}`);
+      const glyph = document.createElement("span");
+      glyph.className = "keyboard-symbol-glyph";
+      glyph.textContent = symbol.glyph;
+      const label = document.createElement("span");
+      label.className = "keyboard-symbol-label";
+      label.textContent = symbol.label;
+      button.append(glyph, label);
+      mobileSymbolResults.append(button);
+    }
+  }
+
+  function getFocusedMobileTextInput() {
+    const activeElement = document.activeElement;
+    return activeElement === mobileLatexInput || activeElement === mobileSymbolSearch ? activeElement : null;
+  }
+
+  function insertTextAtSelection(input, value) {
+    const start = input.selectionStart ?? input.value.length;
+    const end = input.selectionEnd ?? start;
+    input.setRangeText(value, start, end, "end");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  function updateMobileCaseControls() {
+    mobileKeyboard?.querySelectorAll("[data-case]").forEach((button) => {
+      const keyCase = button.getAttribute("data-case");
+      const pressed = keyCase === "shift" ? mobileShiftActive : mobileCapsLockActive;
+      button.classList.toggle("active", pressed);
+      button.setAttribute("aria-pressed", String(pressed));
+    });
+    mobileKeyboard?.querySelectorAll(".keyboard-mode-text [data-insert]").forEach((button) => {
+      const value = button.getAttribute("data-insert") || "";
+      if (/^[a-z]$/i.test(value)) {
+        button.textContent = mobileKeyboardLetter(value, {
+          shifted: mobileShiftActive,
+          capsLock: mobileCapsLockActive,
+        });
+      }
+    });
+  }
+
+  function closeMobileDrawer() {
+    drawer?.classList.remove("mobile-open");
+    if (isTouchInterface) {
+      closeMobileKeyboard();
+      return;
+    }
+    const field = getActiveMathField();
+    field?.focus?.();
+  }
+
+  function toggleMobileDrawer() {
+    if (!drawer) return;
+    drawer.classList.toggle("mobile-open");
+    if (drawer.classList.contains("mobile-open")) {
+      if (isTouchInterface) {
+        openMobileKeyboard();
+        return;
+      }
+      const field = getActiveMathField();
+      field?.focus?.();
+    }
+  }
+
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !colorPalette.hidden) {
       const returnFocus = activeColorAnchor;
       closeColorPalette();
       returnFocus?.focus();
+    }
+    if (event.key === "Escape" && mobileKeyboard && !mobileKeyboard.hidden) {
+      closeMobileKeyboard();
+      getActiveMathField()?.focus?.();
     }
   });
 
@@ -206,15 +395,27 @@ window.addEventListener("DOMContentLoaded", async () => {
   // Pointer focus is the most reliable signal for context-menu paste and for
   // browser/IME keyboard events that do not originate inside the visible span.
   document.addEventListener("pointerdown", (event) => {
+    if (event.target?.closest?.("#mobileKeyboard")) return;
     const field = event.target?.closest?.(".equation-row")?.querySelector?.(".equation-preview");
     if (field?.mathField) lastFocusedMathFieldElement = field;
     else if (!event.target?.closest?.(".color-palette")) lastFocusedMathFieldElement = null;
   }, true);
   document.addEventListener("focusin", (event) => {
+    if (event.target === mobileLatexInput || event.target === mobileSymbolSearch) return;
     const field = event.target?.closest?.(".equation-preview");
     if (field?.mathField) lastFocusedMathFieldElement = field;
     else if (!isMathQuillHiddenInput(event.target)) lastFocusedMathFieldElement = null;
   }, true);
+
+  function suppressMathQuillNativeKeyboard(host) {
+    if (!isTouchInterface) return;
+    for (const textarea of host.querySelectorAll("textarea")) {
+      textarea.setAttribute("inputmode", "none");
+      textarea.setAttribute("autocorrect", "off");
+      textarea.setAttribute("autocapitalize", "off");
+      textarea.setAttribute("spellcheck", "false");
+    }
+  }
 
   // Turn standard LaTeX cases into the editor's supported brace + two-column
   // array notation. The plotter parser already understands this representation,
@@ -656,6 +857,10 @@ window.addEventListener("DOMContentLoaded", async () => {
   let canvasHeight = window.innerHeight;
   /** @type {{x:number,y:number,camera: typeof camera}|null} */
   let dragging = null;
+  /** @type {Map<number, {x:number, y:number}>} */
+  const activeTouches = new Map();
+  /** @type {{startDistance:number,startCamera: typeof camera}|null} */
+  let pinchGesture = null;
   /** @type {number|ReturnType<typeof setTimeout>} */
   let wheelTimer = 0;
   /** @type {typeof camera|null} */
@@ -1789,10 +1994,25 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (!row) return;
     row.classList.toggle("definition", ["variable", "function", "expression"].includes(equation.kind));
     row.classList.toggle("invalid", Boolean(equation.error));
+    const showCompileWarning = equation.kind === "graph" && Boolean(equation.fallbackReason) && !equation.error;
+    row.classList.toggle("not-compiled", showCompileWarning);
     const checkbox = row.querySelector('input[type="checkbox"]');
     if (checkbox) checkbox.style.visibility = equation.kind === "graph" ? "visible" : "hidden";
     const value = row.querySelector(".value-preview");
     if (!value) return;
+    value.classList.toggle("not-compiled", showCompileWarning);
+    value.tabIndex = showCompileWarning ? 0 : -1;
+    if (showCompileWarning) {
+      value.textContent = "Not compiled";
+      value.title = `Not compiled: ${equation.fallbackReason}`;
+      value.setAttribute("role", "status");
+      value.setAttribute("aria-live", "polite");
+      value.setAttribute("aria-label", value.title);
+      return;
+    }
+    value.removeAttribute("role");
+    value.removeAttribute("aria-live");
+    value.removeAttribute("aria-label");
     if (equation.error && equation.latex) {
       value.textContent = "⚠";
     } else if (equation.kind === "variable" && Number.isFinite(equation.definitionValue)) {
@@ -1819,7 +2039,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   function makeEquation(latex = "") {
     return {
       id: nextId++, latex: stripDelimiterDecoration(String(latex || "")), color: COLORS[equations.length % COLORS.length],
-      enabled: true, kind: "graph", definitionValue: null, error: "", fallback: false,
+      enabled: true, kind: "graph", definitionValue: null, error: "", fallback: false, fallbackReason: "",
       evaluate: () => NaN,
     };
   }
@@ -2033,6 +2253,26 @@ window.addEventListener("DOMContentLoaded", async () => {
     input.setAttribute("role", "textbox");
     input.setAttribute("aria-label", `Expression ${index + 1}`);
     input.setAttribute("aria-multiline", "false");
+    input.tabIndex = 0;
+    input.addEventListener("pointerdown", (event) => {
+      if (!isTouchInterface || event.pointerType === "mouse") return;
+      event.preventDefault();
+      event.stopPropagation();
+      lastFocusedMathFieldElement = input;
+      openMobileKeyboard();
+      drawer?.classList.add("mobile-open");
+      queueMicrotask(() => ensureFocusedEquationField(input));
+    });
+    row.addEventListener("pointerdown", (event) => {
+      if (!isTouchInterface || event.pointerType === "mouse") return;
+      if (event.target.closest("button, input, textarea, select")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      lastFocusedMathFieldElement = input;
+      openMobileKeyboard();
+      drawer?.classList.add("mobile-open");
+      queueMicrotask(() => ensureFocusedEquationField(input));
+    });
 
     // Full MathQuill handles interactive backslash commands. For piecewise input,
     // the outer row becomes a small editor composed of one MathQuill field per cell;
@@ -2051,6 +2291,7 @@ window.addEventListener("DOMContentLoaded", async () => {
 
     const makeMathField = (host, latex = "") => {
       const field = MQ.MathField(host, mathFieldConfig);
+      suppressMathQuillNativeKeyboard(host);
       if (latex) field.latex(latex);
       host.piecewiseMathField = field;
       host.addEventListener("focusin", () => {
@@ -2176,10 +2417,12 @@ window.addEventListener("DOMContentLoaded", async () => {
       input.setAttribute("aria-label", `Expression ${index + 1}`);
       input.setAttribute("aria-multiline", "false");
       mathField = MQ.MathField(input, mathFieldConfig);
+      suppressMathQuillNativeKeyboard(input);
       if (latex) mathField.latex(latex);
     };
 
     mathField = MQ.MathField(input, mathFieldConfig);
+    suppressMathQuillNativeKeyboard(input);
 
     const adapter = {
       // MathQuill sizes ( ) [ ] { } by measuring their content. A detached row
@@ -2313,6 +2556,8 @@ window.addEventListener("DOMContentLoaded", async () => {
       equation.sampleRequestedKey = "";
       equation.sampleData = undefined;
       equation.renderKey = "";
+      equation.fallback = false;
+      equation.fallbackReason = "";
       prepareGraphEvaluators();
       updateAllEquationRowPresentations();
       draw();
@@ -2341,13 +2586,6 @@ window.addEventListener("DOMContentLoaded", async () => {
       // Keep edits local to MathQuill; function and method-call sugar is normalized
       // only in normalizeLatex() before the expression reaches the compute engine.
       updatePiecewiseRowStyle();
-      // Append the next empty row without rebuilding the active MathQuill field,
-      // so typing in the middle of a formula never loses the caret.
-      if (equations.indexOf(equation) === equations.length - 1 && input.value.trim()) {
-        const blank = makeEquation();
-        equations.push(blank);
-        equationList.append(createEquationRow(blank, equations.length - 1));
-      }
       if (liveEditTimer !== null) clearTimeout(liveEditTimer);
       liveEditTimer = setTimeout(() => {
         liveEditTimer = null;
@@ -2480,6 +2718,8 @@ window.addEventListener("DOMContentLoaded", async () => {
         equation.sampleRequestedKey = "";
         if (result.error) {
           equation.error = result.error;
+          equation.fallback = false;
+          equation.fallbackReason = "";
           updateAllEquationRowPresentations();
           setStatus(result.error, true);
           draw();
@@ -2502,7 +2742,10 @@ window.addEventListener("DOMContentLoaded", async () => {
               : new Float64Array(component.values),
           })),
         };
+        equation.fallbackReason = result.compilation?.fallbackReason || "";
+        equation.fallback = Boolean(equation.fallbackReason);
         equation.renderKey = "";
+        updateAllEquationRowPresentations();
         draw();
         if (!autoCalculate && isCurrentViewCalculated()) {
           setStatus("Graph calculated for the current view · auto calculation is off");
@@ -2518,6 +2761,8 @@ window.addEventListener("DOMContentLoaded", async () => {
         activeSamples.delete(equation.id);
         equation.sampleRequestedKey = "";
         equation.error = error instanceof Error ? error.message : String(error);
+        equation.fallback = false;
+        equation.fallbackReason = "";
         updateAllEquationRowPresentations();
         setStatus(equation.error, true);
         draw();
@@ -3151,6 +3396,145 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
 
   addExpressionButton.addEventListener("click", () => addEquation());
+  mobileAddExpressionButton?.addEventListener("click", () => {
+    drawer?.classList.add("mobile-open");
+    addEquation();
+    if (isTouchInterface) openMobileKeyboard();
+    else mobileKeyboard?.removeAttribute("hidden");
+  });
+  mobileResetButton?.addEventListener("click", () => {
+    resetView();
+    closeMobileDrawer();
+  });
+  drawerCloseButton?.addEventListener("click", closeMobileDrawer);
+  mobileKeyboard?.addEventListener("pointerdown", (event) => {
+    if (event.target.closest("button")) event.preventDefault();
+  });
+  mobileKeyboard?.querySelectorAll("[data-keyboard-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      setMobileKeyboardMode(button.getAttribute("data-keyboard-mode"));
+    });
+  });
+  mobileKeyboard?.querySelectorAll("[data-case]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (button.getAttribute("data-case") === "shift") mobileShiftActive = !mobileShiftActive;
+      else mobileCapsLockActive = !mobileCapsLockActive;
+      updateMobileCaseControls();
+    });
+  });
+  mobileSymbolSearch?.addEventListener("input", renderMobileSymbolResults);
+  mobileSymbolCategories?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-symbol-category]");
+    if (!button) return;
+    activeMobileSymbolCategory = button.getAttribute("data-symbol-category") || "All";
+    renderMobileSymbolCategories();
+    renderMobileSymbolResults();
+  });
+  mobileSymbolResults?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-symbol-id]");
+    if (!button) return;
+    const symbol = MOBILE_KEYBOARD_SYMBOLS.find((item) => String(item.id) === button.dataset.symbolId);
+    if (symbol) insertIntoActiveMathField(symbol.latex);
+  });
+  mobileKeyboardToggle?.addEventListener("click", () => {
+    if (!mobileKeyboard) return;
+    if (mobileKeyboard.hidden) {
+      openMobileKeyboard();
+      drawer?.classList.add("mobile-open");
+      const field = getActiveMathField();
+      if (field) field.focus?.();
+    } else {
+      closeMobileKeyboard();
+      closeMobileDrawer();
+    }
+  });
+  mobileKeyboard?.querySelectorAll("[data-insert]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const rawValue = button.getAttribute("data-insert");
+      if (!rawValue) return;
+      const isQwertyLetter = Boolean(button.closest(".keyboard-mode-text")) && /^[a-z]$/i.test(rawValue);
+      const value = isQwertyLetter
+        ? mobileKeyboardLetter(rawValue, { shifted: mobileShiftActive, capsLock: mobileCapsLockActive })
+        : rawValue;
+      const textInput = getFocusedMobileTextInput();
+      if (isQwertyLetter && mobileShiftActive) mobileShiftActive = false;
+      updateMobileCaseControls();
+      if (textInput) {
+        insertTextAtSelection(textInput, value);
+        return;
+      }
+      insertIntoActiveMathField(value);
+    });
+  });
+  mobileKeyboard?.querySelectorAll("[data-power]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const rawExponent = button.getAttribute("data-power");
+      const exponent = rawExponent === "" ? null : Number(rawExponent);
+      insertIntoActiveMathField(mobileKeyboardPower(exponent));
+    });
+  });
+  mobileKeyboard?.querySelectorAll("[data-keystroke]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const keystroke = button.getAttribute("data-keystroke");
+      if (!keystroke) return;
+      const textInput = getFocusedMobileTextInput();
+      if (textInput) {
+        const start = textInput.selectionStart ?? textInput.value.length;
+        const end = textInput.selectionEnd ?? start;
+        if (keystroke === "Backspace") {
+          if (start !== end) textInput.setRangeText("", start, end, "start");
+          else if (start > 0) textInput.setRangeText("", start - 1, start, "start");
+          textInput.dispatchEvent(new Event("input", { bubbles: true }));
+        } else if (keystroke === "Left") {
+          textInput.setSelectionRange(Math.max(0, start - 1), Math.max(0, start - 1));
+        } else if (keystroke === "Right") {
+          const next = Math.min(textInput.value.length, end + 1);
+          textInput.setSelectionRange(next, next);
+        } else if (keystroke === "Up") {
+          textInput.setSelectionRange(0, 0);
+        } else if (keystroke === "Down") {
+          const endOfInput = textInput.value.length;
+          textInput.setSelectionRange(endOfInput, endOfInput);
+        }
+        return;
+      }
+      (getActiveMathField() || ensureFocusedEquationField())?.keystroke?.(keystroke);
+    });
+  });
+  mobileKeyboard?.querySelector('[data-action="complete-command"]')?.addEventListener("click", () => {
+    if (document.activeElement === mobileSymbolSearch) return;
+    if (document.activeElement !== mobileLatexInput) {
+      (getActiveMathField() || ensureFocusedEquationField())?.keystroke?.("Tab");
+      return;
+    }
+    const prefix = mobileLatexInput.value.trim().replace(/^\\/, "");
+    if (!prefix) return;
+    const match = MATHQUILL_AUTO_OPERATOR_NAMES.split(/\s+/).find((name) => name.startsWith(prefix));
+    if (match) mobileLatexInput.value = `\\${match}`;
+  });
+  renderMobileSymbolCategories();
+  renderMobileSymbolResults();
+  updateMobileCaseControls();
+  mobileLatexInsertButton?.addEventListener("click", () => {
+    const value = mobileLatexInput?.value.trim();
+    if (!value) return;
+    const field = getActiveMathField() || ensureFocusedEquationField();
+    if (!field) return;
+    insertIntoActiveMathField(value);
+    mobileLatexInput.value = "";
+    if (!isTouchInterface) getActiveMathField()?.focus?.();
+  });
+  mobileLatexInput?.addEventListener("keydown", (event) => {
+    if (event.key !== "Tab") return;
+    event.preventDefault();
+    const prefix = mobileLatexInput.value.trim();
+    if (!prefix) return;
+    const names = MATHQUILL_AUTO_OPERATOR_NAMES.split(/\s+/)
+      .filter((name) => name.startsWith(prefix.replace(/^\\/, "")) || name.startsWith(prefix));
+    if (!names.length) return;
+    const match = names[0];
+    mobileLatexInput.value = match.startsWith("\\") ? match : `\\${match}`;
+  });
   document.querySelector("#exportButton").addEventListener("click", downloadProjectJSON);
   const importButton = document.querySelector("#importButton");
   const importFileInput = /** @type {HTMLInputElement} */ (document.querySelector("#importFileInput"));
@@ -3182,7 +3566,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
 
   canvas.addEventListener("pointerdown", (event) => {
-    if (event.button !== 0) return;
+    if (event.pointerType === "mouse" && event.button !== 0) return;
     hideHoverTooltip();
     if (wheelTimer) {
       clearTimeout(wheelTimer);
@@ -3190,11 +3574,59 @@ window.addEventListener("DOMContentLoaded", async () => {
       wheelBaseCamera = null;
       draw();
     }
-    const rect = canvas.getBoundingClientRect();
-    dragging = { x: event.clientX - rect.left, y: event.clientY - rect.top, camera: { ...camera } };
-    canvas.setPointerCapture(event.pointerId);
+    activeTouches.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (activeTouches.size === 2) {
+      const [first, second] = [...activeTouches.values()];
+      pinchGesture = {
+        startDistance: Math.hypot(second.x - first.x, second.y - first.y),
+        startCamera: { ...camera },
+      };
+      dragging = null;
+      return;
+    }
+    if (activeTouches.size === 1) {
+      const rect = canvas.getBoundingClientRect();
+      dragging = { x: event.clientX - rect.left, y: event.clientY - rect.top, camera: { ...camera } };
+      canvas.setPointerCapture(event.pointerId);
+    }
   });
   canvas.addEventListener("pointermove", (event) => {
+    if (!activeTouches.has(event.pointerId)) return;
+    activeTouches.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+    if (activeTouches.size >= 2 && pinchGesture) {
+      const [first, second] = [...activeTouches.values()];
+      const rect = canvas.getBoundingClientRect();
+      const distance = Math.hypot(second.x - first.x, second.y - first.y);
+      const center = { x: ((first.x + second.x) / 2) - rect.left, y: ((first.y + second.y) / 2) - rect.top };
+      const startCamera = pinchGesture.startCamera;
+      const gesture = normalizeTouchGesture({
+        mode: "pinch",
+        startDistance: pinchGesture.startDistance,
+        currentDistance: distance,
+        centerX: center.x,
+        centerY: center.y,
+        viewWidth: canvasWidth,
+        viewHeight: canvasHeight,
+        camera: startCamera,
+      });
+      const pointerX = center.x;
+      const pointerY = center.y;
+      const [anchorX, anchorY] = toWorld(pointerX, pointerY);
+      const oldXRange = startCamera.xMax - startCamera.xMin;
+      const oldYRange = startCamera.yMax - startCamera.yMin;
+      const newXRange = Math.max(1e-5, Math.min(1e8, oldXRange / Math.max(gesture.zoomFactor, 1e-9)));
+      const newYRange = Math.max(1e-5, Math.min(1e8, oldYRange / Math.max(gesture.zoomFactor, 1e-9)));
+      const xRatio = pointerX / canvasWidth;
+      const yRatio = pointerY / canvasHeight;
+      camera.xMin = anchorX - xRatio * newXRange;
+      camera.xMax = camera.xMin + newXRange;
+      camera.yMax = anchorY + yRatio * newYRange;
+      camera.yMin = camera.yMax - newYRange;
+      drawZoomPreview(startCamera);
+      return;
+    }
+
     if (dragging) {
       hideHoverTooltip();
       const rect = canvas.getBoundingClientRect();
@@ -3219,8 +3651,22 @@ window.addEventListener("DOMContentLoaded", async () => {
     dragging = null;
     draw();
   }
-  canvas.addEventListener("pointerup", stopDragging);
-  canvas.addEventListener("pointercancel", stopDragging);
+  canvas.addEventListener("pointerup", (event) => {
+    if (activeTouches.has(event.pointerId)) {
+      activeTouches.delete(event.pointerId);
+      if (activeTouches.size < 2) {
+        pinchGesture = null;
+      }
+    }
+    if (activeTouches.size === 0) {
+      stopDragging(event);
+    }
+  });
+  canvas.addEventListener("pointercancel", (event) => {
+    activeTouches.delete(event.pointerId);
+    if (activeTouches.size < 2) pinchGesture = null;
+    stopDragging(event);
+  });
   canvas.addEventListener("wheel", (event) => {
     event.preventDefault();
     hideHoverTooltip();

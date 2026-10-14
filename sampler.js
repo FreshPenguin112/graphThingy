@@ -26,6 +26,8 @@ import { compileNativeScalar } from "./native-scalar.js";
 const yieldPort = typeof MessageChannel === "function" ? new MessageChannel() : null;
 const yieldWaiters = [];
 if (yieldPort) yieldPort.port1.onmessage = () => yieldWaiters.shift()?.();
+yieldPort?.port1.unref?.();
+yieldPort?.port2.unref?.();
 function yieldToEventLoop() {
   if (!yieldPort) return new Promise((resolve) => setTimeout(resolve, 0));
   return new Promise((resolve) => {
@@ -724,6 +726,7 @@ export function createInlineSampler() {
     const MAX_CACHED_ENGINES = 8;
     /** Compiled scalar functions, per engine (see createAstEvaluator). */
     const compiledByEngine = new WeakMap();
+    const nativeFunctionsByEngine = new WeakMap();
     function compiledCacheFor(ce) {
       let cache = compiledByEngine.get(ce);
       if (!cache) { cache = new Map(); compiledByEngine.set(ce, cache); }
@@ -755,11 +758,39 @@ export function createInlineSampler() {
       return ce;
     }
 
-    function createAstEvaluator(ce, piecewise) {
+    function nativeFunctionsFor(ce, definitions, knownNames) {
+      const cached = nativeFunctionsByEngine.get(ce);
+      if (cached) return cached;
+      const functions = new Map();
+      for (const definition of definitions) {
+        if (definition.kind !== "function" || !definition.name || !definition.rhs) continue;
+        try {
+          const collectionRhs = transformCollectionSyntax(definition.rhs, ce, knownNames);
+          const normalized = normalizeLatex(
+            normalizePiecewiseEquivalenceForDefinition(collectionRhs),
+            knownNames,
+            true,
+          );
+          const expression = ce.parse(normalized);
+          if (expression?.isValid) {
+            functions.set(definition.name, { args: definition.args || [], body: expression.json });
+          }
+        } catch { /* unsupported definitions remain on the Compute Engine path */ }
+      }
+      nativeFunctionsByEngine.set(ce, functions);
+      return functions;
+    }
+
+    function createAstEvaluator(ce, piecewise, nativeFunctions = new Map(), compilation = null, nativeConstants = new Map()) {
       // Compiled functions depend only on the engine and the AST, so they are shared by
       // every evaluator built on the same engine (pan/zoom re-samples reuse them).
       const compiledCache = compiledCacheFor(ce);
       const noPiecewiseCache = new Map();
+      function noteSymbolicFallback(report, reason) {
+        if (!report) return;
+        report.symbolicEvaluationCount++;
+        if (!report.fallbackReason) report.fallbackReason = reason;
+      }
 
       function containsPiecewise(ast) {
         const symbol = astSymbolName(ast);
@@ -815,9 +846,14 @@ export function createInlineSampler() {
       // Cache by AST object identity: stringifying the AST for every sample was a
       // large share of the per-pixel cost.
       const evaluatorByNode = new WeakMap();
+      function replaceNativeConstants(node) {
+        if (typeof node === "string" && nativeConstants.has(node)) return nativeConstants.get(node);
+        if (!Array.isArray(node)) return node;
+        return [node[0], ...node.slice(1).map(replaceNativeConstants)];
+      }
       function scalarEvaluator(ast) {
         if (ast !== null && typeof ast === "object" && evaluatorByNode.has(ast)) return evaluatorByNode.get(ast);
-        const key = JSON.stringify(ast);
+        const key = JSON.stringify(replaceNativeConstants(ast));
         if (compiledCache.has(key)) {
           const cached = compiledCache.get(key);
           if (ast !== null && typeof ast === "object") evaluatorByNode.set(ast, cached);
@@ -851,12 +887,25 @@ export function createInlineSampler() {
           && (String(node[0]) === "Set" || node.slice(1).some(usesSet));
         const compileAst = lowerIdenticallyEqualForGraph(rewriteMembership(ast));
         const boxedForCompile = ce.box(compileAst);
+        if (compilation) compilation.nativeScalarCompileAttempts++;
+        const nativeCompilation = compileNativeScalar(compileAst, nativeFunctions, nativeConstants);
+        if (compilation && nativeCompilation.compiled) compilation.nativeScalarCompileSuccesses++;
         let compiled = null;
-        if (!usesMembership(compileAst) && !usesSet(compileAst)) {
-          try { compiled = compile(boxedForCompile); } catch { /* use engine fallback */ }
-        }
-        const run = (vars) => {
+        let engineCompileReason = "";
+        if (!nativeCompilation.compiled && !usesMembership(compileAst) && !usesSet(compileAst)) {
           try {
+            compiled = compile(boxedForCompile);
+            if (!compiled.success) engineCompileReason = `Compute Engine could not compile operator "${String(compileAst?.[0] ?? "expression")}".`;
+          } catch (error) {
+            engineCompileReason = `Compute Engine compilation failed: ${error instanceof Error ? error.message : String(error)}`;
+          }
+        }
+        const run = (vars, report = compilation) => {
+          try {
+            if (nativeCompilation.compiled) {
+              const native = nativeCompilation.compiled(vars.x, vars.y);
+              if ((typeof native === "number" && Number.isFinite(native)) || typeof native === "boolean") return native;
+            }
             if (compiled?.success && typeof compiled.run === "function") {
               const raw = compiled.run(vars);
               if (typeof raw === "number" && !Number.isNaN(raw)) return raw;
@@ -871,6 +920,7 @@ export function createInlineSampler() {
             }
             if (Object.hasOwn(vars, "x")) ce.assign("x", vars.x);
             if (Object.hasOwn(vars, "y")) ce.assign("y", vars.y);
+            noteSymbolicFallback(report, nativeCompilation.reason || engineCompileReason || "Compiled evaluation returned no usable scalar value.");
             return runtimeValue(boxed.evaluate().N().valueOf());
           } catch { return NaN; }
         };
@@ -907,8 +957,7 @@ export function createInlineSampler() {
             case "Modulo": {
               const [dividend, divisor] = args;
               if (args.length < 2 || !Number.isFinite(dividend) || !Number.isFinite(divisor) || divisor === 0) return NaN;
-              const modulus = Math.abs(divisor);
-              return ((dividend % modulus) + modulus) % modulus;
+              return ((dividend % divisor) + divisor) % divisor;
             }
             case "Remainder": return args.length < 2 || !Number.isFinite(args[0]) || !Number.isFinite(args[1]) || args[1] === 0 ? NaN : args[0] % args[1];
             case "Power": return Math.pow(args[0], args[1]);
@@ -944,6 +993,7 @@ export function createInlineSampler() {
         try {
           // This slower fallback is for less common/custom operators only. Do not
           // cache by argument values: on a graph those values change for every pixel.
+          noteSymbolicFallback(compilation, `Operator "${op}" is not supported by the scalar evaluator.`);
           const boxed = ce.box([op, ...args]);
           return runtimeValue(boxed.evaluate().N().valueOf());
         } catch { return NaN; }
@@ -965,7 +1015,7 @@ export function createInlineSampler() {
         if (!Array.isArray(ast)) {
           // Raw MathJSON symbol leaves must be resolved through the engine. Returning
           // the string "y" as a value makes broadcasted arithmetic produce NaN.
-          return typeof ast === "string" ? scalarEvaluator(ast)(vars) : ast;
+          return typeof ast === "string" ? scalarEvaluator(ast)(vars, compilation) : ast;
         }
 
         const opName = String(ast[0]);
@@ -991,7 +1041,7 @@ export function createInlineSampler() {
         if (isListAst(ast)) return ast.slice(1).flatMap((item) => flattenList(evaluate(item, vars)));
         if (!containsPiecewise(ast) && !containsList(ast) && !usesMembership(ast) && !["Range", "RangeList", "SequenceRange"].includes(opName)) {
           const evaluator = scalarEvaluator(ast);
-          const value = evaluator(vars);
+          const value = evaluator(vars, compilation);
           // A function may yield an array dynamically despite there being no literal
           // List node in its AST. Keep it intact; if compiled evaluation failed, fall
           // through and evaluate the children so list broadcasting can still happen.
@@ -1004,7 +1054,7 @@ export function createInlineSampler() {
         const args = ast.slice(1).map((arg) => evaluate(arg, vars));
         if (["Range", "RangeList", "SequenceRange"].includes(op)) return numericRange(args) ?? [];
         if (["At", "Index", "Subscript", "Delimiter", "Hold"].includes(op)) {
-          return scalarEvaluator(ast)(vars);
+          return scalarEvaluator(ast)(vars, compilation);
         }
         const vectorArgs = args.filter(Array.isArray);
         if (!vectorArgs.length) return applyScalarOperator(op, args.map((arg) => (typeof arg === "number" && !Number.isFinite(arg)) ? NaN : arg));
@@ -1038,7 +1088,7 @@ export function createInlineSampler() {
           return NaN;
         }
         if (!Array.isArray(ast)) {
-          return typeof ast === "string" ? scalarEvaluator(ast)(vars) : ast;
+          return typeof ast === "string" ? scalarEvaluator(ast)(vars, compilation) : ast;
         }
 
         const op = String(ast[0]);
@@ -1058,7 +1108,7 @@ export function createInlineSampler() {
           return NaN;
         }
         if (!containsPiecewise(ast) && !containsList(ast)) {
-          const value = scalarEvaluator(ast)(vars);
+          const value = scalarEvaluator(ast)(vars, compilation);
           if (Array.isArray(value)) return asNumber(value[index]);
           if (typeof value !== "number" || Number.isFinite(value)) return value;
           // If the compiled whole-expression result is non-finite, recurse below.
@@ -1438,7 +1488,7 @@ export function createInlineSampler() {
       return result;
     }
 
-    function getCompiledComponents(ce, source, knownNames, visibleCamera = null) {
+    function getCompiledComponents(ce, source, knownNames, visibleCamera = null, definitions = [], compilation = null) {
       const relationParts = findTopLevelRelation(source);
       const hadTopLevelRelation = Boolean(relationParts.right);
       let leftSource = relationParts.left, rightSource = relationParts.right;
@@ -1468,7 +1518,27 @@ export function createInlineSampler() {
         throw new Error(details || "Compute Engine could not parse the equation.");
       }
       const ast = ["Subtract", leftExpr.json, rightExpr.json];
-      const evaluator = createAstEvaluator(ce, context.piecewise);
+      const nativeFunctions = nativeFunctionsFor(ce, definitions, knownNames);
+      const nativeConstants = new Map();
+      const loopSymbols = new Set();
+      const collectLoopSymbols = (node) => {
+        if (typeof node === "string" && /^__loop(?:value|index)_\d+$/.test(node)) loopSymbols.add(node);
+        if (Array.isArray(node)) node.slice(1).forEach(collectLoopSymbols);
+      };
+      collectLoopSymbols(ast);
+      for (const branches of context.piecewise.values()) {
+        for (const branch of branches) {
+          collectLoopSymbols(branch.conditionAst);
+          collectLoopSymbols(branch.outputAst);
+        }
+      }
+      for (const name of loopSymbols) {
+        try {
+          const value = ce.box(name).evaluate().N().valueOf();
+          if (typeof value === "number" && Number.isFinite(value)) nativeConstants.set(name, value);
+        } catch { /* unresolved loop values remain on the Compute Engine path */ }
+      }
+      const evaluator = createAstEvaluator(ce, context.piecewise, nativeFunctions, compilation, nativeConstants);
 
       // Coordinate-tuple equalities can describe discrete point sets. Discover them
       // from the actual piecewise AST and its variables instead of hard-coding a
@@ -1904,7 +1974,8 @@ export function createInlineSampler() {
         ? evaluator.scalar(ast) : null;
       // Plain-JS version of the same scalar when the expression is simple enough. It is
       // only used for finite results; everything else falls through to Compute Engine.
-      const nativeScalar = directScalar ? compileNativeScalar(ast) : null;
+      const nativeCompilation = directScalar ? compileNativeScalar(ast) : null;
+      const nativeScalar = nativeCompilation?.compiled || null;
 
       return Array.from({ length: outputCount }, (_, index) => ({
         relation, condition: null,
@@ -1921,7 +1992,7 @@ export function createInlineSampler() {
             const native = nativeScalar(vars.x, vars.y);
             if (typeof native === "number" && Number.isFinite(native)) return native;
           }
-          const value = directScalar(vars);
+          const value = directScalar(vars, compilation);
           if (typeof value === "number" && Number.isFinite(value)) return value;
           const slow = asNumber(evaluator.evaluateAt(ast, vars, index));
           return Number.isFinite(slow) ? slow : NaN;
@@ -1935,6 +2006,12 @@ export function createInlineSampler() {
     const sampleInline = async function sampleInline(message, isCancelled) {
       const { id, key, source, definitions = [], width, height, camera, step = 2 } = message;
       const sampleStartedAt = performance.now();
+      const compilation = {
+        symbolicEvaluationCount: 0,
+        fallbackReason: "",
+        nativeScalarCompileAttempts: 0,
+        nativeScalarCompileSuccesses: 0,
+      };
       console.log("[plotter:sample] started", { equationId: id, source, canvas: { width, height }, camera, step });
       try {
         if (isCancelled()) {
@@ -1944,7 +2021,7 @@ export function createInlineSampler() {
         const ce = acquireEngine(definitions);
         const knownNames = definitions.map((def) => def.name).filter(Boolean);
         declareAxisSymbols(ce);
-        const components = getCompiledComponents(ce, source, knownNames, { ...camera, width, height });
+        const components = getCompiledComponents(ce, source, knownNames, { ...camera, width, height }, definitions, compilation);
         console.log("[plotter:sample] components prepared", {
           equationId: id, componentCount: components.length,
           pointSetComponents: components.filter((component) => component.pointSet).length,
@@ -2051,6 +2128,7 @@ export function createInlineSampler() {
         return {
           type: "sampled", id, key, cols, rows, step,
           components: buffers,
+          compilation,
           error: "",
         };
       } catch (error) {
@@ -2062,6 +2140,7 @@ export function createInlineSampler() {
           type: "sampled", id, key,
           error: error instanceof Error ? error.message : String(error),
           components: [],
+          compilation,
         };
       }
     };

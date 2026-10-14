@@ -32,9 +32,9 @@ ce.declare("y", "number");
 let failures = 0;
 for (const latex of EXPRESSIONS) {
   const json = ce.parse(latex).json;
-  const native = compileNativeScalar(json);
+  const { compiled: native, reason } = compileNativeScalar(json);
   if (!native) {
-    console.error(`not translated: ${latex}`);
+    console.error(`not translated: ${latex} (${reason})`);
     failures++;
     continue;
   }

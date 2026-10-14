@@ -2,7 +2,6 @@
  * Ahead-of-time compilation of simple scalar MathJSON to plain JavaScript.
  *
  * Compute Engine's compiled functions are fast, but a native arrow function is
- * roughly 20x faster per point, which matters on a 250k-point grid. Only a small,
  * well-understood subset is translated. Anything else returns null and the caller
  * keeps using Compute Engine.
  *
@@ -21,11 +20,74 @@ const UNARY = {
 };
 const NARY = { Min: "Math.min", Max: "Math.max" };
 const SYMBOLS = { x: "x", y: "y", Pi: "Math.PI", ExponentialE: "Math.E" };
+const MAX_EXPANSION_NODES = 512;
+const SUPPORTED = new Set([
+  "Rational", "Add", "Multiply", "Subtract", "Divide", "Negate", "Delimiter",
+  "Power", "Mod", "Equal", "Which",
+  ...Object.keys(UNARY), ...Object.keys(NARY),
+]);
+
+function expandFunctions(node, functions, constants, stack, budget) {
+  budget.remaining--;
+  if (budget.remaining < 0) throw new Error(`User-function expansion exceeds ${MAX_EXPANSION_NODES} MathJSON nodes.`);
+  if (typeof node === "string" && constants.has(node)) return constants.get(node);
+  if (!Array.isArray(node)) return node;
+  const operator = node[0];
+  const definition = functions.get(String(operator));
+  if (!definition) {
+    const expanded = [operator];
+    for (let index = 1; index < node.length; index++) {
+      expanded.push(expandFunctions(node[index], functions, constants, stack, budget));
+    }
+    return expanded;
+  }
+  const name = String(operator);
+  if (stack.includes(name)) throw new Error(`Recursive user function "${name}" cannot be compiled.`);
+  const argumentCount = node.length - 1;
+  if (!Array.isArray(definition.args) || definition.args.length !== argumentCount) {
+    throw new Error(`User function "${name}" expects ${definition.args?.length ?? "a known number of"} arguments, received ${argumentCount}.`);
+  }
+  if (definition.body === undefined) throw new Error(`User function "${name}" has no compilable body.`);
+  const bindings = new Map();
+  for (let index = 0; index < argumentCount; index++) {
+    bindings.set(definition.args[index], expandFunctions(node[index + 1], functions, constants, stack, budget));
+  }
+  const substitute = (part) => {
+    budget.cloneRemaining--;
+    if (budget.cloneRemaining < 0) throw new Error(`User-function expansion exceeds ${MAX_EXPANSION_NODES} MathJSON nodes.`);
+    if (typeof part === "string" && bindings.has(part)) return bindings.get(part);
+    if (!Array.isArray(part)) return part;
+    const cloned = [part[0]];
+    for (let index = 1; index < part.length; index++) cloned.push(substitute(part[index]));
+    return cloned;
+  };
+  return expandFunctions(substitute(definition.body), functions, constants, [...stack, name], budget);
+}
+
+function unsupportedReason(node) {
+  if (typeof node === "string") {
+    if (Object.hasOwn(SYMBOLS, node) || node === "True" || node === "False") return null;
+    return `Symbol "${node}" is not supported by the native scalar compiler.`;
+  }
+  if (!Array.isArray(node)) return null;
+  const operator = String(node[0]);
+  if (!SUPPORTED.has(operator)) return `Operator "${operator}" is not supported by the native scalar compiler.`;
+  for (const child of node.slice(1)) {
+    const reason = unsupportedReason(child);
+    if (reason) return reason;
+  }
+  return null;
+}
 
 /** Returns a JS expression string for `node`, or null if it is outside the subset. */
 function emit(node) {
   if (typeof node === "number") return Number.isFinite(node) ? `(${String(node)})` : null;
-  if (typeof node === "string") return Object.hasOwn(SYMBOLS, node) ? SYMBOLS[node] : null;
+  if (typeof node === "string") {
+    if (Object.hasOwn(SYMBOLS, node)) return SYMBOLS[node];
+    if (node === "True") return "true";
+    if (node === "False") return "false";
+    return null;
+  }
   if (!Array.isArray(node)) return null;
   const [op, ...args] = node;
   const parts = args.map(emit);
@@ -41,6 +103,19 @@ function emit(node) {
     case "Divide": return parts.length === 2 ? `(${parts[0]}/${parts[1]})` : null;
     case "Negate": return parts.length === 1 ? `(-${parts[0]})` : null;
     case "Delimiter": return parts.length === 1 ? parts[0] : null;
+    case "Mod": {
+      if (parts.length !== 2) return null;
+      return `((_a,_b)=>((_a%_b)+_b)%_b)(${parts[0]},${parts[1]})`;
+    }
+    case "Equal": return parts.length >= 2 ? `(${parts.slice(1).map((part) => `${parts[0]}===${part}`).join("&&")})` : null;
+    case "Which": {
+      if (parts.length < 2 || parts.length % 2 !== 0) return null;
+      let result = "NaN";
+      for (let index = args.length - 2; index >= 0; index -= 2) {
+        result = args[index] === "True" ? parts[index + 1] : `(${parts[index]}?${parts[index + 1]}:${result})`;
+      }
+      return result;
+    }
     case "Power": {
       if (parts.length !== 2) return null;
       return `Math.pow(${parts[0]},${parts[1]})`;
@@ -56,12 +131,23 @@ function emit(node) {
  * Compile a scalar AST in x and y. Returns `(x, y) => number` or null.
  * Symbols other than x, y and the listed constants make the expression unsupported.
  */
-export function compileNativeScalar(ast) {
-  const body = emit(ast);
-  if (body === null) return null;
+export function compileNativeScalar(ast, functions = new Map(), constants = new Map()) {
+  let expanded;
   try {
-    return new Function("x", "y", `"use strict"; return ${body};`);
-  } catch {
-    return null;
+    expanded = expandFunctions(ast, functions, constants, [], {
+      remaining: MAX_EXPANSION_NODES,
+      cloneRemaining: MAX_EXPANSION_NODES,
+    });
+  } catch (error) {
+    return { compiled: null, reason: error instanceof Error ? error.message : String(error) };
+  }
+  const body = emit(expanded);
+  if (body === null) {
+    return { compiled: null, reason: unsupportedReason(expanded) || "Expression shape is not supported by the native scalar compiler." };
+  }
+  try {
+    return { compiled: new Function("x", "y", `"use strict"; return ${body};`), reason: null };
+  } catch (error) {
+    return { compiled: null, reason: `Generated JavaScript could not be compiled: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
