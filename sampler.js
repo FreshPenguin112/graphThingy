@@ -292,6 +292,28 @@ export function createInlineSampler() {
       return parts;
     }
 
+    /**
+     * If `text` is exactly one parenthesized group — `( … )` or `\left( … \right)` —
+     * return its inner text; otherwise null.
+     */
+    function stripOuterParens(text) {
+      const trimmed = String(text).trim();
+      const open = trimmed.match(/^(\\left\s*)?\(/);
+      if (!open) return null;
+      const openEnd = open[0].length;
+      let depth = 1;
+      for (let i = openEnd; i < trimmed.length; i++) {
+        const ch = trimmed[i];
+        if (ch === "\\") { i++; continue; }
+        if (ch === "(") depth++;
+        else if (ch === ")" && --depth === 0) {
+          if (trimmed.slice(i + 1).trim() !== "") return null;
+          return { inner: trimmed.slice(openEnd, i).replace(/\\right\s*$/, "") };
+        }
+      }
+      return null;
+    }
+
     function findTopLevelIf(source) {
       let depth = 0;
       for (let i = 0; i < source.length; i++) {
@@ -1334,9 +1356,15 @@ export function createInlineSampler() {
       // currently assigned definitions, so [1..d-1] works if `d` is defined.
       result = expandFiniteRanges(result, ce, knownNames);
 
-      const loopMatch = result.match(/^(.*?)(?<![A-Za-z0-9_])for\s+(.+)$/is);
+      // A comprehension may be wrapped in one pair of parentheses, e.g.
+      // `(x, f(i) for i of [0..31])`. Parse the loop inside the wrapper so the
+      // closing paren is not mistaken for part of the iterable.
+      const wrapper = stripOuterParens(result);
+      const loopMatch = (wrapper ? wrapper.inner : result).match(/^(.*?)(?<![A-Za-z0-9_])for\s+(.+)$/is);
       if (loopMatch) {
-        const body = loopMatch[1].trim();
+        const rawBody = loopMatch[1].trim();
+        // A tuple body keeps its grouping, so each output item is one tuple.
+        const body = wrapper && splitTopLevel(rawBody, ",").length > 1 ? `(${rawBody})` : rawBody;
         const clauseText = loopMatch[2].trim()
           .replace(/\\(?:text|operatorname|mathrm)\s*\{\s*of\s*\}/gi, " of ");
         // Names may arrive either as plain identifiers or in MathQuill's text/operator
