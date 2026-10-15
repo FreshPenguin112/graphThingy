@@ -390,13 +390,37 @@ export function createInlineSampler() {
       let sawColonStyle = false;
       for (let index = 0; index < entries.length; index++) {
         const entry = entries[index];
+        // New format: `condition:trueValue,falseValue` (two colons)
+        // e.g. `True:1:0` means if True output 1, else output 0
+        // False value is optional: `True:1` or `True:1,,`
+        const colonParts = splitTopLevel(entry, ":");
+        if (colonParts.length >= 2) {
+          const condition = colonParts[0];
+          // If there are exactly 3 parts (condition:trueValue:falseValue)
+          if (colonParts.length === 3) {
+            const trueOutput = colonParts[1].trim();
+            const falseOutput = colonParts[2].trim();
+            if (condition && trueOutput) {
+              sawColonStyle = true;
+              branches.push({ condition: normalizeCondition(condition), output: trueOutput, falseOutput });
+              continue;
+            }
+          } else if (colonParts.length === 2) {
+            const trueOutput = colonParts[1].trim();
+            if (condition && trueOutput) {
+              sawColonStyle = true;
+              branches.push({ condition: normalizeCondition(condition), output: trueOutput, falseOutput: null });
+              continue;
+            }
+          }
+        }
         // Desmos-style branches are `condition: output, condition: output, default`.
         // The final bare expression is the fallback only when at least one colon
         // branch was seen; ordinary braces such as `{1,2,3}` remain sets.
-        const colonParts = splitTopLevel(entry, ":");
-        if (colonParts.length >= 2) {
-          const condition = colonParts.shift();
-          const output = colonParts.join(":").trim();
+        const colonParts2 = splitTopLevel(entry, ":");
+        if (colonParts2.length >= 2) {
+          const condition = colonParts2.shift();
+          const output = colonParts2.join(":").trim();
           if (condition && output) {
             sawColonStyle = true;
             branches.push({ condition: normalizeCondition(condition), output });
@@ -739,7 +763,15 @@ export function createInlineSampler() {
           const details = invalid?.errors?.map(String).join("; ");
           throw new Error(details || `Could not parse piecewise branch: ${branch.output} if ${branch.condition}`);
         }
-        return { outputAst: outputExpr.json, conditionAst: conditionExpr.json };
+        let falseOutputAst = null;
+        if (branch.falseOutput) {
+          const falseOutputSource = transformPiecewise(branch.falseOutput, context);
+          const falseOutputExpr = context.ce.parse(normalizeLatex(falseOutputSource, context.knownNames));
+          if (falseOutputExpr?.isValid) {
+            falseOutputAst = falseOutputExpr.json;
+          }
+        }
+        return { outputAst: outputExpr.json, conditionAst: conditionExpr.json, falseOutputAst };
       });
       context.piecewise.set(name, prepared);
       return name;
@@ -1031,6 +1063,9 @@ export function createInlineSampler() {
             const condition = evaluate(branch.conditionAst, vars);
             if (asBoolean(condition)) {
               const value = evaluate(branch.outputAst, vars);
+              values.push(...flattenList(value));
+            } else if (branch.falseOutputAst !== null && branch.falseOutputAst !== undefined) {
+              const value = evaluate(branch.falseOutputAst, vars);
               values.push(...flattenList(value));
             }
           }
