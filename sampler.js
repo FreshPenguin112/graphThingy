@@ -198,6 +198,8 @@ export function normalizeLatex(source, knownNames = [], allowGeneratedConditionE
     // brackets, before parsing. The AST helpers below handle either resulting
     // List JSON or a Delimiter wrapper around that List.
     result = result.replace(/\\left|\\right/g, "");
+    // Strip trailing \) that may remain from stripped \right) in comprehensions
+    result = result.replace(/\)+$/, ")");
     result = result.replace(/\\lbrack/g, "[");
     result = result.replace(/\\rbrack/g, "]");
     return result;
@@ -1232,6 +1234,7 @@ export function createInlineSampler() {
     function expandFiniteRanges(source, ce, knownNames) {
       let result = String(source)
         .replace(/\\left\s*\[/g, "[")
+        .replace(/\\right\\s*\)/g, ")")
         .replace(/\\right\s*\]/g, "]")
         .replace(/\\lbrack/g, "[")
         .replace(/\\rbrack/g, "]");
