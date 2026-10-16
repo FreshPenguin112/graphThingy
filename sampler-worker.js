@@ -2,10 +2,10 @@
  * Runs expression sampling off the main thread.
  *
  * Protocol (all messages are plain objects):
- *   main -> worker  { type: "sample", reqId, id, key, source, definitions, width, height, camera, step }
- *   main -> worker  { type: "warmup" }                  build the default engine ahead of time
- *   main -> worker  { type: "cancel", reqId }           stop a job whose result is no longer wanted
- *   worker -> main  { type: "sampled", reqId, result }  result is null when the job was cancelled
+ *   main -> worker  { type: "sampleBatch", reqId, jobs: [...] }
+ *   main -> worker  { type: "warmup" }                       build the default engine ahead of time
+ *   main -> worker  { type: "cancel", reqId }                stop a batch whose result is no longer wanted
+ *   worker -> main  { type: "sampledBatch", reqId, results } one result per job, or null if cancelled
  *
  * Grid buffers are transferred, not copied, so large samples cost no extra memory traffic.
  */
@@ -14,8 +14,38 @@ import { createInlineSampler } from "./sampler.js";
 const sampleInline = createInlineSampler();
 /** Request ids the main thread has abandoned; checked between chunks of work. */
 const cancelledRequests = new Set();
+let workerQueue = Promise.resolve();
 
-self.addEventListener("message", async (event) => {
+async function sampleBatch(message) {
+  const { reqId } = message;
+  try {
+    const results = await sampleInline.batch(message.jobs || [], () => cancelledRequests.has(reqId));
+    const transfer = [];
+    for (const item of results || []) {
+      for (const component of item.result?.components || []) {
+        if (component.values?.buffer) transfer.push(component.values.buffer);
+      }
+    }
+    self.postMessage({ type: "sampledBatch", reqId, results }, transfer);
+  } catch (error) {
+    self.postMessage({
+      type: "sampledBatch", reqId,
+      results: (message.jobs || []).map((job) => ({
+        id: job.id,
+        key: job.key,
+        result: {
+          type: "sampled", id: job.id, key: job.key,
+          error: error instanceof Error ? error.message : String(error),
+          components: [],
+        },
+      })),
+    });
+  } finally {
+    cancelledRequests.delete(reqId);
+  }
+}
+
+self.addEventListener("message", (event) => {
   const message = event.data;
   if (message?.type === "cancel") {
     cancelledRequests.add(message.reqId);
@@ -25,27 +55,8 @@ self.addEventListener("message", async (event) => {
     try { sampleInline.warmUp(); } catch { /* the first sample reports engine errors */ }
     return;
   }
-  if (message?.type !== "sample") return;
-
-  const { reqId } = message;
-  let result;
-  try {
-    result = await sampleInline(message, () => cancelledRequests.has(reqId));
-  } catch (error) {
-    result = {
-      type: "sampled", id: message.id, key: message.key,
-      error: error instanceof Error ? error.message : String(error),
-      components: [],
-    };
-  }
-  cancelledRequests.delete(reqId);
-  if (!result) {
-    self.postMessage({ type: "sampled", reqId, result: null });
+  if (message?.type === "sampleBatch") {
+    workerQueue = workerQueue.then(() => sampleBatch(message));
     return;
   }
-  const transfer = [];
-  for (const component of result.components || []) {
-    if (component.values?.buffer) transfer.push(component.values.buffer);
-  }
-  self.postMessage({ type: "sampled", reqId, result }, transfer);
 });

@@ -7,6 +7,4 @@ test_mathquill_latex.mjs
 package-lock.json
 jsconfig.json
 tsconfig.json
-test*
 docs
-*.mjs

@@ -855,6 +855,19 @@ export function createInlineSampler() {
         return ast.some((child, index) => index > 0 && containsPiecewise(child));
       }
 
+      function containsLoopConstant(ast) {
+        if (typeof ast === "string") return nativeConstants.has(ast);
+        return Array.isArray(ast) && ast.slice(1).some(containsLoopConstant);
+      }
+
+      function substituteFunctionArguments(ast, bindings) {
+        if (typeof ast === "string" && bindings.has(ast)) return bindings.get(ast);
+        if (!Array.isArray(ast)) return ast;
+        return [ast[0], ...ast.slice(1).map((child) => substituteFunctionArguments(child, bindings))];
+      }
+
+      const activeLoopFunctions = new Set();
+
       // Set membership such as x\in\mathbb{Z} is evaluated directly in JS. Sending it
       // through the symbolic engine once per sample made graphs take forever.
       const FAST_SETS = {
@@ -1069,15 +1082,28 @@ export function createInlineSampler() {
               values.push(...flattenList(value));
             }
           }
-          return values;
+          return values.length > 0 ? values : NaN;
         }
         if (!Array.isArray(ast)) {
           // Raw MathJSON symbol leaves must be resolved through the engine. Returning
           // the string "y" as a value makes broadcasted arithmetic produce NaN.
+          if (typeof ast === "string" && nativeConstants.has(ast)) return nativeConstants.get(ast);
           return typeof ast === "string" ? scalarEvaluator(ast)(vars, compilation) : ast;
         }
 
         const opName = String(ast[0]);
+        if (containsLoopConstant(ast)) {
+          const definition = nativeFunctions.get(opName);
+          if (definition && definition.args?.length === ast.length - 1 && !activeLoopFunctions.has(opName)) {
+            const bindings = new Map(definition.args.map((name, index) => [name, ast[index + 1]]));
+            activeLoopFunctions.add(opName);
+            try {
+              return evaluate(substituteFunctionArguments(definition.body, bindings), vars);
+            } finally {
+              activeLoopFunctions.delete(opName);
+            }
+          }
+        }
         // Compute Engine represents some bracketed list literals as a Delimiter
         // wrapper around the actual List/Range AST, e.g. `\left\lbrack1,2\right\rbrack`.
         // Unwrap presentation delimiters before vectorization; treating Delimiter as
@@ -1098,7 +1124,8 @@ export function createInlineSampler() {
           if (range) return range;
         }
         if (isListAst(ast)) return ast.slice(1).flatMap((item) => flattenList(evaluate(item, vars)));
-        if (!containsPiecewise(ast) && !containsList(ast) && !usesMembership(ast) && !["Range", "RangeList", "SequenceRange"].includes(opName)) {
+        if (!containsPiecewise(ast) && !containsList(ast) && !usesMembership(ast)
+          && !["Range", "RangeList", "SequenceRange"].includes(opName)) {
           const evaluator = scalarEvaluator(ast);
           const value = evaluator(vars, compilation);
           // A function may yield an array dynamically despite there being no literal
@@ -1384,7 +1411,7 @@ export function createInlineSampler() {
     function transformCollectionSyntax(source, ce, knownNames) {
       let result = String(source)
         .replace(/(?<!\\)\\[ ,;:!]/g, " ")
-        .replace(/\\(?:text|operatorname|mathrm)\s*\{\s*for\s*\}/gi, " for ");
+        .replace(/\\(?:text|operatorname|mathrm)\s*\{\s*for\s*(?![A-Za-z0-9_])\}/gi, " for ");
 
       // Expand [a..b] / [a..b..c] to explicit lists before anything tries to
       // iterate or broadcast them. Symbolic bounds are resolved against the
@@ -1660,21 +1687,6 @@ export function createInlineSampler() {
       // in MathJSON, so each coordinate can be evaluated independently.
       const tupleItems = (node) => Array.isArray(node) && ["Tuple", "Vector"].includes(String(node[0])) && node.length === 3
         ? [node[1], node[2]] : null;
-      if (!hadTopLevelRelation && visibleCamera && Array.isArray(rightTuple) && String(rightTuple[0]) === "List") {
-        const children = rightTuple.slice(1);
-        if (children.length && children.every((child) => tupleItems(child))) {
-          const points = [];
-          for (const child of children) {
-            const pair = tupleItems(child);
-            const x = evalFiniteScalar(pair[0]), y = evalFiniteScalar(pair[1]);
-            if (x !== null && y !== null && x >= visibleCamera.xMin && x <= visibleCamera.xMax
-              && y >= visibleCamera.yMin && y <= visibleCamera.yMax) points.push({ x, y });
-          }
-          console.log("[plotter:point-set] expanded spread/comprehension points", { source, tupleCount: children.length, pointsFound: points.length });
-          return [{ relation: "=", pointSet: true, points }];
-        }
-      }
-
       const containsGraphVariable = (node, name) => {
         if (astSymbolName(node) === name) return true;
         return Array.isArray(node) && node.slice(1).some((child) => containsGraphVariable(child, name));
@@ -1695,6 +1707,87 @@ export function createInlineSampler() {
         }
         return false;
       };
+      if (!hadTopLevelRelation && visibleCamera && Array.isArray(rightTuple) && String(rightTuple[0]) === "List") {
+        const children = rightTuple.slice(1);
+        if (children.length && children.every((child) => tupleItems(child))) {
+          const pairs = children.map(tupleItems);
+          const dynamic = pairs.some((pair) => dependsOnGraphAxes(pair[0]) || dependsOnGraphAxes(pair[1]));
+          const points = [];
+          const seen = new Set();
+          if (!dynamic) {
+            for (const [xAst, yAst] of pairs) {
+              const x = evalFiniteScalar(xAst), y = evalFiniteScalar(yAst);
+              if (x !== null && y !== null && x >= visibleCamera.xMin && x <= visibleCamera.xMax
+                && y >= visibleCamera.yMin && y <= visibleCamera.yMax) points.push({ x, y });
+            }
+          } else {
+            const markers = new Set(pairs.flatMap((pair) => [
+              ...referencedPiecewiseNames(pair[0]), ...referencedPiecewiseNames(pair[1]),
+            ]));
+            const branches = [...markers].flatMap((name) => context.piecewise.get(name) || []);
+            const latticeAxes = new Set();
+            const scanLattice = (node) => {
+              if (!Array.isArray(node)) return;
+              const operator = String(node[0]);
+              if ((operator === "Element" || operator === "NotElement") && node.length === 3) {
+                const name = astSymbolName(node[1]);
+                if ((name === "x" || name === "y") && ["Integers", "NonNegativeIntegers", "PositiveIntegers"].includes(astSymbolName(node[2]))) {
+                  latticeAxes.add(name);
+                }
+              } else if (operator === "Equal" && Array.isArray(node[1]) && String(node[1][0]) === "Floor") {
+                const name = astSymbolName(node[2]);
+                if ((name === "x" || name === "y") && astSymbolName(node[1][1]) === name) latticeAxes.add(name);
+              }
+              node.slice(1).forEach(scanLattice);
+            };
+            for (const [xAst, yAst] of pairs) {
+              scanLattice(xAst);
+              scanLattice(yAst);
+            }
+            for (const branch of branches) scanLattice(branch.conditionAst);
+            const usesX = pairs.some((pair) => containsGraphVariable(pair[0], "x") || containsGraphVariable(pair[1], "x"))
+              || branches.some((branch) => containsGraphVariable(branch.conditionAst, "x") || containsGraphVariable(branch.outputAst, "x"));
+            const usesY = pairs.some((pair) => containsGraphVariable(pair[0], "y") || containsGraphVariable(pair[1], "y"))
+              || branches.some((branch) => containsGraphVariable(branch.conditionAst, "y") || containsGraphVariable(branch.outputAst, "y"));
+            const enumerableAxes = new Set([...(usesX ? ["x"] : []), ...(usesY ? ["y"] : [])]);
+            const axesAreDiscrete = enumerableAxes.size > 0 && [...enumerableAxes].every((axis) => latticeAxes.has(axis));
+            if (axesAreDiscrete) {
+              const integerCandidates = (axis) => {
+                const min = Math.ceil(axis === "x" ? visibleCamera.xMin - 1e-10 : visibleCamera.yMin - 1e-10);
+                const max = Math.floor(axis === "x" ? visibleCamera.xMax + 1e-10 : visibleCamera.yMax + 1e-10);
+                const count = Math.max(0, max - min + 1);
+                const stride = Math.max(1, Math.ceil(count / 20000));
+                const values = [];
+                for (let value = min; value <= max && values.length < 20000; value += stride) values.push(value);
+                return values;
+              };
+              const xs = usesX ? integerCandidates("x") : [0];
+              const ys = usesY ? integerCandidates("y") : [0];
+              for (const x of xs) {
+                for (const y of ys) {
+                  const variables = { x, y };
+                  for (const [xAst, yAst] of pairs) {
+                    const xsForTuple = flattenList(evaluator.evaluate(xAst, variables)).map(asNumber).filter(Number.isFinite);
+                    const ysForTuple = flattenList(evaluator.evaluate(yAst, variables)).map(asNumber).filter(Number.isFinite);
+                    for (const pointX of xsForTuple) {
+                      if (pointX < visibleCamera.xMin || pointX > visibleCamera.xMax) continue;
+                      for (const pointY of ysForTuple) {
+                        if (pointY < visibleCamera.yMin || pointY > visibleCamera.yMax) continue;
+                        const key = `${pointX}\u0000${pointY}`;
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+                        points.push({ x: pointX === 0 ? 0 : pointX, y: pointY === 0 ? 0 : pointY });
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          console.log("[plotter:point-set] expanded spread/comprehension points", { source, tupleCount: children.length, pointsFound: points.length, dynamic });
+          return [{ relation: "=", pointSet: true, points }];
+        }
+      }
       // A bare parenthesized pair is a point, not a two-item list of y-values.
       // Constant coordinates are evaluated directly. Piecewise coordinates that
       // depend on x/y are handled by the camera-bounded enumeration below.
@@ -2214,7 +2307,20 @@ export function createInlineSampler() {
     // definitions, and the structured piecewise editor. Export the shared helpers on
     // the returned sampler so both paths use the exact same parsing implementation.
     /** Build the engine for the common no-definitions case before the first request. */
-    sampleInline.warmUp = () => { acquireEngine([]); };
+    sampleInline.warmUp = () => {
+      const ce = acquireEngine([]);
+      ce.parse("0");
+    };
+    sampleInline.batch = async (messages, isCancelled = () => false) => {
+      const results = [];
+      for (const message of messages) {
+        if (isCancelled()) return null;
+        const result = await sampleInline(message, isCancelled);
+        if (isCancelled()) return null;
+        results.push({ id: message.id, key: message.key, result });
+      }
+      return results;
+    };
     sampleInline.helpers = {
       findEnvironmentEnd,
       splitTopLevel,

@@ -756,6 +756,13 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   /** @type {ComputeEngineInstance} */
   let ce = new ComputeEngine();
+  globalThis.ce = ce;
+  ce.effects = {
+    console: {
+      log: (line) => console.log("CE Output:", line),
+      readLine: (prompt) => undefined, // don't support readLine
+    },
+  };
 
   // Keep one world unit the same number of pixels on both axes.
   // The horizontal range stays at 20 units by default; the vertical range is
@@ -786,69 +793,104 @@ window.addEventListener("DOMContentLoaded", async () => {
   /** Worker requests waiting for a result, keyed by request id. */
   const pendingSampleRequests = new Map();
   let nextSampleRequestId = 1;
-  /** @type {Worker|null} */
-  let samplerWorker = null;
+  const MAX_SAMPLER_WORKERS = 1;
+  /** @type {Worker[]} */
+  const samplerWorkers = [];
+  const workerLoads = new Map();
+  let activeSampleBatch = null;
   let samplerWorkerUnavailable = false;
   // Start the worker now so its startup (loading the engine) overlaps with page setup.
-  getSamplerWorker()?.postMessage({ type: "warmup" });
+  getSamplerWorkers().forEach((worker) => worker.postMessage({ type: "warmup" }));
 
-  function getSamplerWorker() {
-    if (samplerWorker || samplerWorkerUnavailable) return samplerWorker;
+  function getSamplerWorkers() {
+    if (samplerWorkerUnavailable) return samplerWorkers;
+    while (samplerWorkers.length < MAX_SAMPLER_WORKERS) {
+      let worker;
+      try {
+        worker = new SamplerWorker();
+      } catch (error) {
+        console.warn("[plotter] Web Workers are unavailable; sampling on the main thread.", error);
+        if (samplerWorkers.length === 0) samplerWorkerUnavailable = true;
+        break;
+      }
+      samplerWorkers.push(worker);
+      workerLoads.set(worker, 0);
     try {
-      const worker = new SamplerWorker();
       worker.addEventListener("message", (event) => {
-        const { reqId, result } = event.data;
-        const resolve = pendingSampleRequests.get(reqId);
-        if (!resolve) return;
+        const { reqId, results } = event.data;
+        const request = pendingSampleRequests.get(reqId);
+        if (!request) return;
         pendingSampleRequests.delete(reqId);
-        resolve(result ?? null);
+        workerLoads.set(worker, Math.max(0, (workerLoads.get(worker) || 1) - 1));
+        request.resolve(results ?? null);
       });
       worker.addEventListener("error", (event) => {
         console.error("[plotter:sample] worker failed; sampling on the main thread from now on", event);
         worker.terminate();
-        samplerWorker = null;
-        samplerWorkerUnavailable = true;
-        // Anything in flight is re-run on the main thread by its caller.
-        const waiting = [...pendingSampleRequests.values()];
-        pendingSampleRequests.clear();
-        for (const resolve of waiting) resolve({ retryOnMainThread: true });
+        const workerIndex = samplerWorkers.indexOf(worker);
+        if (workerIndex >= 0) samplerWorkers.splice(workerIndex, 1);
+        workerLoads.delete(worker);
+        // Only retry this worker's in-flight requests. Other workers remain usable.
+        for (const [reqId, request] of pendingSampleRequests) {
+          if (request.worker !== worker) continue;
+          pendingSampleRequests.delete(reqId);
+          request.resolve({ retryOnMainThread: true });
+        }
+        if (samplerWorkers.length === 0) samplerWorkerUnavailable = true;
       });
-      samplerWorker = worker;
-    } catch (error) {
-      console.warn("[plotter] Web Workers are unavailable; sampling on the main thread.", error);
-      samplerWorkerUnavailable = true;
+      } catch (error) {
+        console.warn("[plotter] Could not initialize a sampler worker.", error);
+        worker.terminate();
+        samplerWorkers.pop();
+        workerLoads.delete(worker);
+        if (samplerWorkers.length === 0) samplerWorkerUnavailable = true;
+        break;
+      }
     }
-    return samplerWorker;
+    return samplerWorkers;
+  }
+
+  function getLeastBusySamplerWorker() {
+    return getSamplerWorkers().reduce((leastBusy, worker) => !leastBusy
+      || (workerLoads.get(worker) || 0) < (workerLoads.get(leastBusy) || 0) ? worker : leastBusy, null);
   }
 
   /**
    * Start one sample job. Returns the request id (used to cancel it) and a promise
    * that resolves to the result, or null when the job was cancelled.
    */
-  function startSampleRequest(message, cancelled) {
+  function startSampleBatch(jobs, cancelled) {
     const reqId = nextSampleRequestId++;
-    const worker = getSamplerWorker();
+    const worker = getLeastBusySamplerWorker();
     const promise = new Promise((resolve) => {
       if (worker) {
-        pendingSampleRequests.set(reqId, resolve);
-        worker.postMessage({ ...message, type: "sample", reqId });
+        pendingSampleRequests.set(reqId, { resolve, worker });
+        workerLoads.set(worker, (workerLoads.get(worker) || 0) + 1);
+        worker.postMessage({ type: "sampleBatch", reqId, jobs });
       } else {
-        sampleInline(message, cancelled).then(resolve);
+        sampleInline.batch(jobs, cancelled).then(resolve);
       }
-    }).then((result) => (result?.retryOnMainThread ? sampleInline(message, cancelled) : result));
+    }).then((results) => (results?.retryOnMainThread ? sampleInline.batch(jobs, cancelled) : results));
     return { reqId, promise };
   }
 
-  /** Stop the sample job for an equation whose result is no longer wanted. */
+  /** Cancel the current shared batch if it contains an invalidated row. */
   function cancelSampleRequest(equation) {
-    const reqId = equation.sampleReqId;
-    if (!reqId) return;
-    equation.sampleReqId = 0;
-    const resolve = pendingSampleRequests.get(reqId);
-    if (!resolve) return;
-    pendingSampleRequests.delete(reqId);
-    samplerWorker?.postMessage({ type: "cancel", reqId });
-    resolve(null);
+    const batch = activeSampleBatch;
+    if (!batch || !batch.entries.some((entry) => entry.equation === equation)) return;
+    activeSampleBatch = null;
+    const request = pendingSampleRequests.get(batch.reqId);
+    if (request) {
+      pendingSampleRequests.delete(batch.reqId);
+      workerLoads.set(request.worker, Math.max(0, (workerLoads.get(request.worker) || 1) - 1));
+      request.worker.postMessage({ type: "cancel", reqId: batch.reqId });
+    }
+    for (const entry of batch.entries) {
+      if (activeSamples.get(entry.equation.id) === entry.token) activeSamples.delete(entry.equation.id);
+      if (entry.equation.sampleRequestedKey === entry.key) entry.equation.sampleRequestedKey = "";
+      entry.equation.sampleReqId = 0;
+    }
+    request?.resolve(null);
   }
   /** @type {Equation[]} */
   const equations = [];
@@ -1336,6 +1378,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (!left) return { kind: /** @type {const} */ ("graph"), latex };
 
     if (!hasEquals) {
+      // A standalone coordinate pair is graph content even when one coordinate
+      // contains a constant piecewise expression with no x/y dependencies.
+      if (isPointTupleSource(left)) return { kind: /** @type {const} */ ("graph"), latex, pointExpression: true };
+
       // Route static piecewise value expressions through our multi-match evaluator.
       // Compute Engine's native Piecewise stops at the first true branch, while the
       // plotter's Desmos-style brace syntax intentionally gathers every true output.
@@ -1364,9 +1410,6 @@ window.addEventListener("DOMContentLoaded", async () => {
       } catch {
         // Invalid or variable-dependent piecewise input falls through to normal classification.
       }
-      // Parenthesized coordinate pairs are graphable points even when their
-      // coordinates are constants or named variables with no x/y dependency.
-      if (isPointTupleSource(left)) return { kind: /** @type {const} */ ("graph"), latex, pointExpression: true };
       // Let the normal parser decide whether a custom call needs a value preview
       // or graph sampling: f(5) is a value, while f(x) depends on the graph axis.
       if (resolveRealMembership(left) !== null) return { kind: /** @type {const} */ ("expression"), latex };
@@ -1516,7 +1559,10 @@ window.addEventListener("DOMContentLoaded", async () => {
       return `[${value.slice(0, 12).map((item) => formatPreviewValue(item, depth + 1)).join(",")}${value.length > 12 ? ",…" : ""}]`;
     }
     if (typeof value === "boolean") return value ? "True" : "False";
-    if (typeof value === "number") return Number.isFinite(value) ? String(Number((Math.abs(value) < 1e-12 ? 0 : value).toPrecision(7))) : "undefined";
+    if (typeof value === "number") {
+        if (Number.isNaN(value)) return "NaN";
+        return Number.isFinite(value) ? String(Number((Math.abs(value) < 1e-12 ? 0 : value).toPrecision(7))) : "undefined";
+    }
     if (value === null || value === undefined) return "undefined";
     if (typeof value === "string") {
       const trimmed = value.trim();
@@ -1651,6 +1697,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       delete item.name;
       delete item.args;
       delete item.rhs;
+      delete item.pointExpression;
       if (!item.latex.trim()) continue;
       try {
         const definition = parseDefinitionSource(item.latex);
@@ -1856,6 +1903,7 @@ window.addEventListener("DOMContentLoaded", async () => {
         delete item.name;
         delete item.args;
         delete item.rhs;
+        delete item.pointExpression;
         const parsed = classifyExpression(item.latex, knownVariableNames, knownDefinitionNames);
         Object.assign(item, parsed);
         if (item.kind === "expression" && item.latex.trim()) updateExpressionPreview(item);
@@ -1864,6 +1912,22 @@ window.addEventListener("DOMContentLoaded", async () => {
 
     for (const item of equations) {
       if (item.kind !== "graph" || !item.latex.trim()) continue;
+      const preparedKey = `${definitionRevision}\u0000${item.latex}`;
+      if (item.pointExpression) {
+        if (item.preparedKey !== preparedKey || !item.preparedOk) {
+          item.error = "";
+          item.fallback = false;
+          item.fallbackReason = "";
+          item.sampleData = undefined;
+          item.sampleRequestedKey = "";
+          item.renderKey = "";
+          item.evaluate = () => NaN;
+          item.preparedKey = preparedKey;
+          item.preparedOk = true;
+          activeSamples.delete(item.id);
+        }
+        continue;
+      }
       if (isIncompleteSpreadSource(item.latex)) {
         // A partial spread token is an editing state, not a bad equation. Drop any
         // stale sampled picture/evaluator and wait until an operand is entered.
@@ -1897,7 +1961,6 @@ window.addEventListener("DOMContentLoaded", async () => {
         continue;
       }
       if (item.error) continue;
-      const preparedKey = `${definitionRevision}\u0000${item.latex}`;
       if (item.preparedKey === preparedKey && item.preparedOk) continue;
       try {
         const [leftText0, rightText0, hasRelation, relation] = splitEquation(item.latex);
@@ -2673,59 +2736,81 @@ window.addEventListener("DOMContentLoaded", async () => {
   function ensureSampled(equation, viewKey, forceSampling = false) {
     const sampleKey = sampleKeyFor(equation, viewKey);
     if (equation.sampleData?.sampleKey === sampleKey) return true;
-    // In manual mode, only an explicit Calculate click can start sampling for a
-    // camera/expression key that has not already been sampled. Also invalidate a
-    // queued job for an older camera so it does not keep consuming CPU in the
-    // background after the user pans or zooms.
     if (!autoCalculate && !forceSampling) {
-      if (equation.sampleRequestedKey && equation.sampleRequestedKey !== sampleKey) {
-        activeSamples.delete(equation.id);
-        equation.sampleRequestedKey = "";
-        cancelSampleRequest(equation);
-      }
+      if (activeSampleBatch && activeSampleBatch.viewKey !== viewKey) cancelSampleRequest(activeSampleBatch.entries[0].equation);
       return false;
     }
-    if (equation.sampleRequestedKey !== sampleKey) {
-      equation.sampleRequestedKey = sampleKey;
-      cancelSampleRequest(equation);
-      const token = {};
-      activeSamples.set(equation.id, token);
-      const definitions = equations
-        .filter((item) => !item.error && item.name && (item.kind === "variable" || item.kind === "function") && item.rhs)
-        .map((item) => ({ kind: item.kind, name: item.name, args: item.args || [], rhs: item.rhs }));
-      const message = {
-        type: "sample", id: equation.id, key: sampleKey, source: equation.latex,
-        definitions, width: canvasWidth, height: canvasHeight,
-        camera: { xMin: camera.xMin, xMax: camera.xMax, yMin: camera.yMin, yMax: camera.yMax },
-        step: SAMPLE_STEP,
-      };
-      const cancelled = () => activeSamples.get(equation.id) !== token
-        || !equations.includes(equation)
-        || equation.sampleRequestedKey !== sampleKey;
 
-      const request = startSampleRequest(message, cancelled);
-      equation.sampleReqId = request.reqId;
-      request.promise.then((result) => {
-        if (!result || cancelled()) {
-          // Do not let an abandoned request remain marked as pending forever.
-          if (activeSamples.get(equation.id) === token) {
-            activeSamples.delete(equation.id);
-            if (equation.sampleRequestedKey === sampleKey) equation.sampleRequestedKey = "";
-          }
-          return;
+    if (activeSampleBatch) {
+      if (activeSampleBatch.viewKey === viewKey) return false;
+      cancelSampleRequest(activeSampleBatch.entries[0].equation);
+    }
+
+    const pending = equations.filter((item) => item.enabled && item.kind === "graph" && !item.error
+      && item.latex.trim() && item.sampleData?.sampleKey !== sampleKeyFor(item, viewKey));
+    if (!pending.length) return false;
+
+    const definitions = equations
+      .filter((item) => !item.error && item.name && (item.kind === "variable" || item.kind === "function") && item.rhs)
+      .map((item) => ({ kind: item.kind, name: item.name, args: item.args || [], rhs: item.rhs }));
+    const entries = pending.map((item) => ({
+      equation: item,
+      key: sampleKeyFor(item, viewKey),
+      token: {},
+    }));
+    const jobs = entries.map(({ equation: item, key }) => ({
+      id: item.id,
+      key,
+      source: item.latex,
+      definitions,
+      width: canvasWidth,
+      height: canvasHeight,
+      camera: { xMin: camera.xMin, xMax: camera.xMax, yMin: camera.yMin, yMax: camera.yMax },
+      step: SAMPLE_STEP,
+    }));
+    for (const entry of entries) {
+      entry.equation.sampleRequestedKey = entry.key;
+      activeSamples.set(entry.equation.id, entry.token);
+    }
+    const batch = { reqId: 0, viewKey, entries };
+    activeSampleBatch = batch;
+    const cancelled = () => activeSampleBatch !== batch
+      || entries.some(({ equation: item, token, key }) => activeSamples.get(item.id) !== token
+        || !equations.includes(item) || item.sampleRequestedKey !== key);
+    const request = startSampleBatch(jobs, cancelled);
+    batch.reqId = request.reqId;
+    for (const entry of entries) entry.equation.sampleReqId = request.reqId;
+
+    request.promise.then((results) => {
+      if (activeSampleBatch !== batch) return;
+      activeSampleBatch = null;
+      if (!results) {
+        for (const { equation: item, token, key } of entries) {
+          if (activeSamples.get(item.id) !== token) continue;
+          activeSamples.delete(item.id);
+          if (item.sampleRequestedKey === key) item.sampleRequestedKey = "";
+          item.sampleReqId = 0;
         }
-        activeSamples.delete(equation.id);
-        equation.sampleRequestedKey = "";
+        return;
+      }
+
+      const resultsById = new Map(results.map((entry) => [entry.id, entry.result]));
+      let firstError = "";
+      for (const { equation: item, token, key } of entries) {
+        if (activeSamples.get(item.id) !== token || !equations.includes(item)) continue;
+        activeSamples.delete(item.id);
+        item.sampleRequestedKey = "";
+        item.sampleReqId = 0;
+        const result = resultsById.get(item.id);
+        if (!result) continue;
         if (result.error) {
-          equation.error = result.error;
-          equation.fallback = false;
-          equation.fallbackReason = "";
-          updateAllEquationRowPresentations();
-          setStatus(result.error, true);
-          draw();
-          return;
+          item.error = result.error;
+          item.fallback = false;
+          item.fallbackReason = "";
+          firstError ||= result.error;
+          continue;
         }
-        equation.sampleData = {
+        item.sampleData = {
           sampleKey: result.key,
           cols: result.cols,
           rows: result.rows,
@@ -2742,32 +2827,33 @@ window.addEventListener("DOMContentLoaded", async () => {
               : new Float64Array(component.values),
           })),
         };
-        equation.fallbackReason = result.compilation?.fallbackReason || "";
-        equation.fallback = Boolean(equation.fallbackReason);
-        equation.renderKey = "";
-        updateAllEquationRowPresentations();
-        draw();
-        if (!autoCalculate && isCurrentViewCalculated()) {
-          setStatus("Graph calculated for the current view · auto calculation is off");
-        }
-      }).catch((error) => {
-        if (cancelled()) {
-          if (activeSamples.get(equation.id) === token) {
-            activeSamples.delete(equation.id);
-            if (equation.sampleRequestedKey === sampleKey) equation.sampleRequestedKey = "";
-          }
-          return;
-        }
-        activeSamples.delete(equation.id);
-        equation.sampleRequestedKey = "";
-        equation.error = error instanceof Error ? error.message : String(error);
-        equation.fallback = false;
-        equation.fallbackReason = "";
-        updateAllEquationRowPresentations();
-        setStatus(equation.error, true);
-        draw();
-      });
-    }
+        item.fallbackReason = result.compilation?.fallbackReason || "";
+        item.fallback = Boolean(item.fallbackReason);
+        item.renderKey = "";
+      }
+      updateAllEquationRowPresentations();
+      if (firstError) setStatus(firstError, true);
+      draw();
+      if (!autoCalculate && isCurrentViewCalculated()) {
+        setStatus("Graph calculated for the current view · auto calculation is off");
+      }
+    }).catch((error) => {
+      if (activeSampleBatch !== batch) return;
+      activeSampleBatch = null;
+      const message = error instanceof Error ? error.message : String(error);
+      for (const { equation: item, token, key } of entries) {
+        if (activeSamples.get(item.id) !== token) continue;
+        activeSamples.delete(item.id);
+        item.sampleRequestedKey = "";
+        item.sampleReqId = 0;
+        item.error = message;
+        item.fallback = false;
+        item.fallbackReason = "";
+      }
+      updateAllEquationRowPresentations();
+      setStatus(message, true);
+      draw();
+    });
     return false;
   }
 
@@ -3087,6 +3173,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
     const ready = ensureSampled(equation, viewKey, forceSampling);
     if (!ready) return;
+    if (equation.pointExpression && hasPendingPointExpressionSamples(viewKey)) return;
     if (equation.renderKey !== key || layer.width !== canvas.width || layer.height !== canvas.height) {
       if (layer.width !== canvas.width) layer.width = canvas.width;
       if (layer.height !== canvas.height) layer.height = canvas.height;
@@ -3099,6 +3186,12 @@ window.addEventListener("DOMContentLoaded", async () => {
       equation.renderKey = key;
     }
     ctx.drawImage(layer, 0, 0, canvasWidth, canvasHeight);
+  }
+
+  function hasPendingPointExpressionSamples(viewKey) {
+    return equations.some((item) => item.enabled && item.kind === "graph" && item.pointExpression
+      && !item.error && item.latex.trim()
+      && item.sampleData?.sampleKey !== sampleKeyFor(item, viewKey));
   }
 
   function draw(forceSampling = false) {
@@ -3591,7 +3684,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   });
   canvas.addEventListener("pointermove", (event) => {
-    if (!activeTouches.has(event.pointerId)) return;
+    if (!activeTouches.has(event.pointerId)) {
+      if (activeTouches.size === 0 && !dragging && event.pointerType !== "touch") updateHoverReadout(event);
+      return;
+    }
     activeTouches.set(event.pointerId, { x: event.clientX, y: event.clientY });
 
     if (activeTouches.size >= 2 && pinchGesture) {
